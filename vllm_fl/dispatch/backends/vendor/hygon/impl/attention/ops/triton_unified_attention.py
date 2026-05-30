@@ -726,7 +726,7 @@ def _get_tile_size(
         return 32
     if is_prefill:
         return 32
-    return 16 if element_size >= 2 else 32
+    return 32  # Hygon DCU gfx926: larger tile reduces loop iterations
 
 
 def unified_attention(
@@ -964,6 +964,8 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            num_warps=4,
+            num_stages=1,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
