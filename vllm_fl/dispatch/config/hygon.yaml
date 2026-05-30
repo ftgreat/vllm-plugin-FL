@@ -29,8 +29,8 @@ strict: false
 op_backends:
   # All operators: prioritize FlagGems (Triton), fallback to vendor, then reference
   attention_backend:
-    - flagos
     - vendor:hygon
+    - flagos
     - reference
 
   rms_norm:
