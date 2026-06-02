@@ -138,7 +138,7 @@ def causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=128,
         num_warps=num_warps,
         num_stages=num_stages,
     )
