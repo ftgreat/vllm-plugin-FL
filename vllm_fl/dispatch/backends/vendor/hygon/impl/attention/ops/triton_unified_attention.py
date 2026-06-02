@@ -910,6 +910,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            num_warps=2,
             num_stages=1,
         )
     else:
@@ -964,7 +965,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
-            num_warps=4,
+            num_warps=2,
             num_stages=1,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
