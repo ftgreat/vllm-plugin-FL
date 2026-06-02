@@ -78,6 +78,12 @@ def register_model():
     register_quant_linear()
     register_router()
 
+    # Apply Hygon DCU monkey-patches if running on Hygon
+    from vllm_fl.utils import DeviceInfo
+    if DeviceInfo().vendor_name == "hygon":
+        from vllm_fl.dispatch.backends.vendor.hygon.patch import apply_hygon_patches
+        apply_hygon_patches()
+
     # Register GLM-5 (GlmMoeDsa) — config not yet upstream
     try:
         from vllm.transformers_utils.config import _CONFIG_REGISTRY
