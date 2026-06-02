@@ -114,8 +114,9 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
     BV = min(triton.next_power_of_2(V), 32)
-    # Hygon DCU optimization: num_warps=2 reduces register spills on gfx926
-    num_stages = 3
+    # Hygon DCU optimization: num_warps=2 reduces register spills,
+    # num_stages=1 disables software pipelining to further reduce register pressure on gfx926
+    num_stages = 1
     num_warps = 2
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
