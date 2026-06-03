@@ -18,6 +18,7 @@ def apply_hygon_patches():
     patch_ssm_state_dtype()
     patch_fla_packed_decode()
     patch_causal_conv1d_update()
+    patch_chunk_delta_h()
 
 
 def patch_ssm_state_dtype():
@@ -78,3 +79,18 @@ def patch_causal_conv1d_update():
         logger.info("Patched causal_conv1d_update for Hygon DCU (num_warps=2, num_stages=1)")
     except Exception as e:
         logger.warning("Failed to patch causal_conv1d_update for Hygon: %s", e)
+
+
+def patch_chunk_delta_h():
+    """Patch chunk_gated_delta_rule_fwd_kernel_h_blockdim64 with num_stages=1 for Hygon DCU."""
+    try:
+        import flag_gems.fused.FLA.chunk_delta_h as _chunk_h_lib
+
+        from .impl.chunk_delta_h import (
+            chunk_gated_delta_rule_fwd_kernel_h_blockdim64 as hygon_chunk_h,
+        )
+
+        _chunk_h_lib.chunk_gated_delta_rule_fwd_kernel_h_blockdim64 = hygon_chunk_h
+        logger.info("Patched chunk_gated_delta_rule_fwd_kernel_h_blockdim64 for Hygon DCU (num_stages=1)")
+    except Exception as e:
+        logger.warning("Failed to patch chunk_delta_h for Hygon: %s", e)
