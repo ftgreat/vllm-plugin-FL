@@ -6,6 +6,8 @@
 # spot: the FlagGems libtuner only searches BV={32,64} with num_stages={2,3,4}, so
 # BV=64 + num_stages=1 was never evaluated. BV=64 halves grid size and may improve
 # MFMA utilization with wider tiles.
+# exp_43: Expand autotune search to include num_stages=2 and additional
+# num_warps configs. bf16 state changed compute/memory ratio since exp_34.
 # ruff: noqa: E501
 
 import triton
@@ -30,8 +32,13 @@ from flag_gems.utils import libentry
 @triton.autotune(
     configs=[
         triton.Config({"BV": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 64}, num_warps=4, num_stages=2),
         triton.Config({"BV": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BV": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BV": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 32}, num_warps=4, num_stages=2),
         triton.Config({"BV": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BV": 32}, num_warps=2, num_stages=2),
     ],
     key=["H", "K", "V", "BT", "IS_VARLEN", "USE_INITIAL_STATE", "STORE_FINAL_STATE"],
     use_cuda_graph=use_cuda_graph,
