@@ -36,11 +36,12 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     H = q_dim // K
 
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), 16)
-    # Hygon DCU optimization: num_warps=2 reduces register spills,
-    # num_stages=1 disables software pipelining to further reduce register pressure on gfx926
+    BV = min(triton.next_power_of_2(V), 32)
+    # Hygon DCU optimization: num_warps=1 gives 256 VGPRs/warp (vs 128 with num_warps=2),
+    # allowing BV=32 without register spills. BV=32 halves grid blocks (NV=4 vs NV=8),
+    # reducing wave count and launch overhead. num_stages=1 disables software pipelining.
     num_stages = 1
-    num_warps = 2
+    num_warps = 1
 
     NV = triton.cdiv(V, BV)
     grid = (NV, B * HV)
