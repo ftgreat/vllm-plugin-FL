@@ -69,7 +69,7 @@ def packed_decode_kernel_blockptr(
         block_shape=(BV, BK),
         order=(1, 0),
     )
-    b_h = tl.load(p_h0_block, boundary_check=()).to(tl.float32)
+    b_h = tl.load(p_h0_block, boundary_check=(0, 1)).to(tl.float32)
 
     p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
     q_off = i_h * K + o_k
@@ -110,7 +110,7 @@ def packed_decode_kernel_blockptr(
         block_shape=(BV, BK),
         order=(1, 0),
     )
-    tl.store(p_ht_block, b_h.to(p_ht_block.type.element_ty), boundary_check=())
+    tl.store(p_ht_block, b_h.to(p_ht_block.type.element_ty), boundary_check=(0, 1))
 
 
 def fused_recurrent_gated_delta_rule_packed_decode(

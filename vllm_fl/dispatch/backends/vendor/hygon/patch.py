@@ -3,7 +3,6 @@
 """Hygon-specific monkey-patches for DCU optimization."""
 
 import logging
-import torch
 
 logger = logging.getLogger(__name__)
 _patches_applied = False
@@ -22,21 +21,12 @@ def apply_hygon_patches():
 
 
 def patch_ssm_state_dtype():
-    """Override GDN SSM state dtype from fp32 to bf16 to halve HBM I/O for packed_decode."""
-    try:
-        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
+    """SSM state dtype patch — keep original float32 to preserve numerical precision.
 
-        _original_gdn_state_dtype = MambaStateDtypeCalculator.gated_delta_net_state_dtype
-
-        @classmethod
-        def _bf16_gated_delta_net_state_dtype(cls, model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype="auto"):
-            conv_state_dtype, _ = _original_gdn_state_dtype.__func__(cls, model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype)
-            return (conv_state_dtype, torch.bfloat16)
-
-        MambaStateDtypeCalculator.gated_delta_net_state_dtype = _bf16_gated_delta_net_state_dtype
-        logger.info("Patched gated_delta_net_state_dtype: SSM temporal state forced to bfloat16")
-    except Exception as e:
-        logger.warning("Failed to patch SSM state dtype for Hygon: %s", e)
+    Previous versions forced bfloat16 to halve HBM I/O, but the 7-bit mantissa
+    causes compounding accumulation error in the recurrent state h across tokens.
+    """
+    logger.info("SSM state dtype: using upstream default (float32) for precision")
 
 
 def patch_fla_packed_decode():
