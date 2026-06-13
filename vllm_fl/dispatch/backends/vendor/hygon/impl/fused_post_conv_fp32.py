@@ -1,7 +1,13 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 #
-# Precision fix: when L2 normalization is applied, output q/k in float32
-# to avoid bf16 truncation before chunk_gated_delta_rule kernel.
+# Precision fix: skip L2 normalization in fused_post_conv_prep so that the
+# downstream chunk_gated_delta_rule kernel can perform it in float32 internally
+# (use_qk_l2norm_in_kernel=True), avoiding the bf16 truncation that occurs
+# when L2-normalized q/k are materialized to bf16 between the two kernels.
+#
+# This file provides a patched fused_post_conv_prep that forces
+# apply_l2norm=False, paired with a patch to gdn_linear_attn that sets
+# use_qk_l2norm_in_kernel=True in the chunk_gated_delta_rule call.
 
 from __future__ import annotations
 
@@ -11,7 +17,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _fused_post_conv_kernel_fp32(
+def _fused_post_conv_kernel_no_l2norm(
     # ---- inputs ----
     mixed_qkv_ptr,  # [L, qkv_dim] conv'd output (contiguous)
     a_ptr,  # [L, HV]
@@ -20,8 +26,8 @@ def _fused_post_conv_kernel_fp32(
     A_log_ptr,  # [HV]
     dt_bias_ptr,  # [HV]
     # ---- outputs ----
-    q_ptr,  # [L, H, K] contiguous — float32 when L2norm applied
-    k_ptr,  # [L, H, K] contiguous — float32 when L2norm applied
+    q_ptr,  # [L, H, K] contiguous
+    k_ptr,  # [L, H, K] contiguous
     v_ptr,  # [L, HV, V] contiguous
     g_ptr,  # [L, HV] float32
     beta_ptr,  # [L, HV] float32
@@ -38,22 +44,19 @@ def _fused_post_conv_kernel_fp32(
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    APPLY_L2NORM: tl.constexpr,
-    L2NORM_EPS: tl.constexpr,
     OUTPUT_G_EXP: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
 ):
-    """Single fused kernel for post-conv1d preparation.
+    """Fused post-conv1d kernel: split qkv + gating, WITHOUT L2 normalization.
 
-    Precision fix: when APPLY_L2NORM is True, q and k are stored in float32
-    to preserve the precision of L2-normalized values, avoiding bf16 truncation
-    before the chunk_gated_delta_rule kernel.
+    L2 normalization is deferred to chunk_gated_delta_rule kernel where it
+    runs entirely in float32 without intermediate bf16 materialization.
 
     Grid: (ceil(L, BLOCK_T), H + HV)
-      - program_id(1) in [0, H):    Q/K head processing + l2norm
+      - program_id(1) in [0, H):    Q/K head processing (no l2norm)
       - program_id(1) in [H, H+HV): V head processing + gating
     """
     i_tb = tl.program_id(0)
@@ -65,7 +68,7 @@ def _fused_post_conv_kernel_fp32(
     mask_t = offs_t < L
 
     if i_head < H:
-        # ============ Q/K head processing ============
+        # ============ Q/K head processing (no L2 normalization) ============
         i_h = i_head
         offs_k = tl.arange(0, BK)  # [BK]
         mask_k = offs_k < K
@@ -73,42 +76,19 @@ def _fused_post_conv_kernel_fp32(
 
         # Load Q features: mixed_qkv[t, i_h*K + k]
         q_offsets = offs_t[:, None] * stride_x_tok + i_h * K + offs_k[None, :]
-        q_f32 = tl.load(mixed_qkv_ptr + q_offsets, mask=mask_2d, other=0).to(
-            tl.float32
-        )
+        q_vals = tl.load(mixed_qkv_ptr + q_offsets, mask=mask_2d, other=0)
 
         # Load K features: mixed_qkv[t, HK + i_h*K + k]
         k_offsets = offs_t[:, None] * stride_x_tok + HK + i_h * K + offs_k[None, :]
-        k_f32 = tl.load(mixed_qkv_ptr + k_offsets, mask=mask_2d, other=0).to(
-            tl.float32
-        )
+        k_vals = tl.load(mixed_qkv_ptr + k_offsets, mask=mask_2d, other=0)
 
-        if APPLY_L2NORM:
-            q_sq_sum = tl.sum(q_f32 * q_f32, axis=1)  # [BLOCK_T]
-            q_inv = 1.0 / tl.sqrt(q_sq_sum + L2NORM_EPS)
-            q_f32 = q_f32 * q_inv[:, None]
-
-            k_sq_sum = tl.sum(k_f32 * k_f32, axis=1)
-            k_inv = 1.0 / tl.sqrt(k_sq_sum + L2NORM_EPS)
-            k_f32 = k_f32 * k_inv[:, None]
-
-        # Store Q — keep float32 when L2norm is applied to avoid bf16 truncation
+        # Store Q (original dtype, no l2norm applied)
         q_out = offs_t[:, None] * stride_q_tok + i_h * K + offs_k[None, :]
-        if APPLY_L2NORM:
-            tl.store(q_ptr + q_out, q_f32, mask=mask_2d)
-        else:
-            tl.store(
-                q_ptr + q_out, q_f32.to(q_ptr.dtype.element_ty), mask=mask_2d
-            )
+        tl.store(q_ptr + q_out, q_vals, mask=mask_2d)
 
-        # Store K — keep float32 when L2norm is applied to avoid bf16 truncation
+        # Store K (original dtype, no l2norm applied)
         k_out = offs_t[:, None] * stride_k_tok + i_h * K + offs_k[None, :]
-        if APPLY_L2NORM:
-            tl.store(k_ptr + k_out, k_f32, mask=mask_2d)
-        else:
-            tl.store(
-                k_ptr + k_out, k_f32.to(k_ptr.dtype.element_ty), mask=mask_2d
-            )
+        tl.store(k_ptr + k_out, k_vals, mask=mask_2d)
     else:
         # ============ V head + gating processing ============
         i_hv = i_head - H
@@ -167,10 +147,12 @@ def fused_post_conv_prep(
     apply_l2norm: bool = True,
     output_g_exp: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused post-conv1d prep: split + l2norm + gating in one kernel.
+    """Fused post-conv1d prep: split + gating in one kernel (L2norm deferred).
 
-    Precision fix: when apply_l2norm=True, q and k are allocated and stored
-    in float32 to avoid bf16 truncation of the normalized values.
+    This version intentionally skips L2 normalization regardless of the
+    apply_l2norm parameter. L2 normalization should instead be performed
+    inside chunk_gated_delta_rule (use_qk_l2norm_in_kernel=True) where
+    it runs entirely in float32 without intermediate bf16 truncation.
 
     Args:
         conv_output: [L, qkv_dim] contiguous conv'd mixed_qkv
@@ -181,12 +163,12 @@ def fused_post_conv_prep(
         num_k_heads: number of K heads (H)
         head_k_dim: dimension per K head (K)
         head_v_dim: dimension per V head (V)
-        apply_l2norm: whether to L2-normalize q and k
+        apply_l2norm: ignored (always False); kept for API compatibility
         output_g_exp: if True, output exp(g) instead of g (for FlashInfer)
 
     Returns:
-        q: [L, H, K] contiguous (float32 if l2norm applied, else original dtype)
-        k: [L, H, K] contiguous (float32 if l2norm applied, else original dtype)
+        q: [L, H, K] contiguous (original dtype, no l2norm)
+        k: [L, H, K] contiguous (original dtype, no l2norm)
         v: [L, HV, V] contiguous
         g: [L, HV] float32
         beta: [L, HV] float32
@@ -204,10 +186,8 @@ def fused_post_conv_prep(
         f"qkv_dim={qkv_dim} != 2*H*K + HV*V = {2 * H * K + HV * V}"
     )
 
-    # Precision fix: allocate q/k in float32 when L2norm is applied
-    qk_dtype = torch.float32 if apply_l2norm else dtype
-    q = torch.empty(L, H, K, dtype=qk_dtype, device=device)
-    k = torch.empty(L, H, K, dtype=qk_dtype, device=device)
+    q = torch.empty(L, H, K, dtype=dtype, device=device)
+    k = torch.empty(L, H, K, dtype=dtype, device=device)
     v = torch.empty(L, HV, V, dtype=dtype, device=device)
     g = torch.empty(L, HV, dtype=torch.float32, device=device)
     beta = torch.empty(L, HV, dtype=torch.float32, device=device)
@@ -220,9 +200,8 @@ def fused_post_conv_prep(
     BV = triton.next_power_of_2(V)
     BLOCK_T = 16  # tokens per block
 
-    # Single kernel: blocks [0,H) do Q/K, blocks [H, H+HV) do V+gating
     grid = (triton.cdiv(L, BLOCK_T), H + HV)
-    _fused_post_conv_kernel_fp32[grid](
+    _fused_post_conv_kernel_no_l2norm[grid](
         mixed_qkv_ptr=conv_output,
         a_ptr=a,
         b_ptr=b,
@@ -244,8 +223,6 @@ def fused_post_conv_prep(
         HV=HV,
         K=K,
         V=V,
-        APPLY_L2NORM=apply_l2norm,
-        L2NORM_EPS=1e-6,
         OUTPUT_G_EXP=output_g_exp,
         SOFTPLUS_THRESHOLD=20.0,
         BLOCK_T=BLOCK_T,

@@ -18,7 +18,7 @@ def apply_hygon_patches():
     patch_fla_packed_decode()
     patch_causal_conv1d_update()
     patch_chunk_delta_h()
-    patch_fused_post_conv_fp32()
+    patch_prefill_l2norm_precision()
 
 
 def patch_ssm_state_dtype():
@@ -87,12 +87,16 @@ def patch_chunk_delta_h():
         logger.warning("Failed to patch chunk_delta_h for Hygon: %s", e)
 
 
-def patch_fused_post_conv_fp32():
-    """Patch fused_post_conv_prep to output q/k in float32 when L2norm is applied.
+def patch_prefill_l2norm_precision():
+    """Move L2 normalization from fused_post_conv_prep into chunk_gated_delta_rule.
 
-    The upstream kernel truncates L2-normalized q/k to bf16 before passing them
-    to the chunk_gated_delta_rule kernel, losing precision in the 7-bit mantissa.
-    This patch keeps q/k in float32 after L2 normalization.
+    Problem: The upstream fused_post_conv_prep applies L2 normalization to q/k
+    in float32 but then truncates to bf16 when storing. The downstream
+    chunk_gated_delta_rule receives these truncated values, losing precision.
+
+    Fix: Skip L2norm in fused_post_conv_prep (replace with no-l2norm version),
+    and force use_qk_l2norm_in_kernel=True in ChunkGatedDeltaRule.forward_native
+    so that L2 normalization happens entirely in float32 inside the chunk kernel.
     """
     try:
         import vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv as _post_conv_lib
@@ -100,12 +104,35 @@ def patch_fused_post_conv_fp32():
         import vllm.model_executor.layers.mamba.gdn_linear_attn as _gdn_lib
 
         from .impl.fused_post_conv_fp32 import (
-            fused_post_conv_prep as fp32_fused_post_conv_prep,
+            fused_post_conv_prep as no_l2norm_fused_post_conv_prep,
         )
 
-        _post_conv_lib.fused_post_conv_prep = fp32_fused_post_conv_prep
-        _fla_ops.fused_post_conv_prep = fp32_fused_post_conv_prep
-        _gdn_lib.fused_post_conv_prep = fp32_fused_post_conv_prep
-        logger.info("Patched fused_post_conv_prep for float32 L2norm output (precision fix)")
+        # 1. Replace fused_post_conv_prep with version that skips L2norm
+        _post_conv_lib.fused_post_conv_prep = no_l2norm_fused_post_conv_prep
+        _fla_ops.fused_post_conv_prep = no_l2norm_fused_post_conv_prep
+        _gdn_lib.fused_post_conv_prep = no_l2norm_fused_post_conv_prep
+
+        # 2. Patch ChunkGatedDeltaRule.forward_native to always use
+        #    use_qk_l2norm_in_kernel=True (L2norm inside chunk kernel in fp32)
+        _ChunkGDR = _gdn_lib.ChunkGatedDeltaRule
+        _orig_forward_native = _ChunkGDR.forward_native
+
+        def _patched_forward_native(self, q, k, v, g, beta, initial_state,
+                                    output_final_state, cu_seqlens=None,
+                                    chunk_indices=None, chunk_offsets=None,
+                                    use_qk_l2norm_in_kernel=True):
+            return _orig_forward_native(
+                self, q, k, v, g, beta, initial_state,
+                output_final_state, cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
+                use_qk_l2norm_in_kernel=True,
+            )
+
+        _ChunkGDR.forward_native = _patched_forward_native
+
+        logger.info(
+            "Patched prefill L2norm precision: fused_post_conv_prep skips L2norm, "
+            "ChunkGatedDeltaRule.forward_native uses use_qk_l2norm_in_kernel=True"
+        )
     except Exception as e:
-        logger.warning("Failed to patch fused_post_conv_prep: %s", e)
+        logger.warning("Failed to patch prefill L2norm precision: %s", e)
