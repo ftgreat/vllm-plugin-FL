@@ -18,6 +18,7 @@ def apply_hygon_patches():
     patch_fla_packed_decode()
     patch_causal_conv1d_update()
     patch_chunk_delta_h()
+    patch_fused_post_conv_fp32()
 
 
 def patch_ssm_state_dtype():
@@ -84,3 +85,27 @@ def patch_chunk_delta_h():
         logger.info("Patched chunk_gated_delta_rule_fwd_kernel_h_blockdim64 for Hygon DCU (num_stages=1)")
     except Exception as e:
         logger.warning("Failed to patch chunk_delta_h for Hygon: %s", e)
+
+
+def patch_fused_post_conv_fp32():
+    """Patch fused_post_conv_prep to output q/k in float32 when L2norm is applied.
+
+    The upstream kernel truncates L2-normalized q/k to bf16 before passing them
+    to the chunk_gated_delta_rule kernel, losing precision in the 7-bit mantissa.
+    This patch keeps q/k in float32 after L2 normalization.
+    """
+    try:
+        import vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv as _post_conv_lib
+        import vllm.model_executor.layers.fla.ops as _fla_ops
+        import vllm.model_executor.layers.mamba.gdn_linear_attn as _gdn_lib
+
+        from .impl.fused_post_conv_fp32 import (
+            fused_post_conv_prep as fp32_fused_post_conv_prep,
+        )
+
+        _post_conv_lib.fused_post_conv_prep = fp32_fused_post_conv_prep
+        _fla_ops.fused_post_conv_prep = fp32_fused_post_conv_prep
+        _gdn_lib.fused_post_conv_prep = fp32_fused_post_conv_prep
+        logger.info("Patched fused_post_conv_prep for float32 L2norm output (precision fix)")
+    except Exception as e:
+        logger.warning("Failed to patch fused_post_conv_prep: %s", e)
