@@ -53,8 +53,8 @@ class HygonBackend(Backend):
 
         if use_mla:
             raise NotImplementedError("MLA not supported on Hygon yet.")
-        if use_sparse:
-            raise ValueError("use_sparse=True requires use_mla=True.")
+        # Sparse attention is supported via softmax_threshold at runtime
+        # (controlled by VLLM_SPARSE_THRESHOLD env var)
 
         register_backend(
             backend=AttentionBackendEnum.TRITON_ATTN,
