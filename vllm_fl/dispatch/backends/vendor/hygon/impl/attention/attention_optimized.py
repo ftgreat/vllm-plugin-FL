@@ -24,6 +24,11 @@ _SPARSE_THRESHOLD = (
     else None
 )
 
+if _SPARSE_THRESHOLD is not None:
+    logger.info("Sparse attention enabled with threshold=%s", _SPARSE_THRESHOLD)
+else:
+    logger.info("Sparse attention disabled")
+
 
 class AttentionOptimizedBackend(TritonAttentionBackend):
     """Optimized attention backend using V1-style split 2D/3D kernels.

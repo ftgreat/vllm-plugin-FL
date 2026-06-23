@@ -869,6 +869,17 @@ def unified_attention(
     use_sparse = softmax_threshold is not None and softmax_threshold > 0.0
     softmax_threshold_val = float(softmax_threshold) if use_sparse else 0.0
 
+    # Log sparse attention status once on first call
+    if not hasattr(unified_attention, '_logged_sparse'):
+        unified_attention._logged_sparse = True
+        if use_sparse:
+            logger.info(
+                "unified_attention: sparse attention ACTIVE (threshold=%.6f)",
+                softmax_threshold_val,
+            )
+        else:
+            logger.info("unified_attention: sparse attention INACTIVE")
+
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
