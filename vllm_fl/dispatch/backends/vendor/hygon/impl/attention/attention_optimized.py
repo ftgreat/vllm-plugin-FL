@@ -1,6 +1,8 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
 # Optimized attention backend using V1-style split 2D/3D Triton kernels.
 
+import os
+
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
@@ -12,6 +14,20 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.utils.torch_utils import is_quantized_kv_cache
 
 logger = init_logger(__name__)
+
+# Sparse attention threshold from environment variable.
+# Set VLLM_SPARSE_THRESHOLD to a positive float (e.g. 0.001) to enable.
+_SPARSE_THRESHOLD_ENV = os.environ.get('VLLM_SPARSE_THRESHOLD', '0')
+_SPARSE_THRESHOLD = (
+    float(_SPARSE_THRESHOLD_ENV)
+    if float(_SPARSE_THRESHOLD_ENV) > 0
+    else None
+)
+
+if _SPARSE_THRESHOLD is not None:
+    logger.info("Sparse attention enabled with threshold=%s", _SPARSE_THRESHOLD)
+else:
+    logger.info("Sparse attention disabled")
 
 
 class AttentionOptimizedBackend(TritonAttentionBackend):
@@ -140,6 +156,7 @@ class AttentionOptimizedImpl(TritonAttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            softmax_threshold=_SPARSE_THRESHOLD,
         )
 
         return output

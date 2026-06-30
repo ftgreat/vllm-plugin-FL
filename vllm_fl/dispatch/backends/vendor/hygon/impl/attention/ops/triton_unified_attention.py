@@ -113,6 +113,8 @@ def kernel_unified_attention_2d(
     USE_FP8: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    softmax_threshold=0.0,
+    USE_SPARSE: tl.constexpr = False,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -170,6 +172,13 @@ def kernel_unified_attention_2d(
 
     seq_len = tl.load(seq_lens_ptr + seq_idx)
     context_len = seq_len - cur_batch_query_len
+
+    # Sparse attention: compute per-row adaptive threshold in ln domain
+    if USE_SPARSE:
+        query_abs_pos_sparse = (context_len + query_pos).to(tl.float32)
+        seq_len_f = tl.maximum(seq_len.to(tl.float32), 1.0)
+        sparse_thr = softmax_threshold * (query_abs_pos_sparse + 1.0) / seq_len_f
+        sparse_thr_ln = tl.log(sparse_thr)  # shape [BLOCK_M]
 
     if USE_ALIBI_SLOPES:
         alibi_slope = tl.load(
@@ -240,19 +249,6 @@ def kernel_unified_attention_2d(
         else:
             K = K_load
 
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
-
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = seq_offset[None, :] <= query_abs_pos
 
@@ -308,24 +304,47 @@ def kernel_unified_attention_2d(
             )
             S += qq_bias
 
-        m_j = tl.maximum(M, tl.max(S, axis=1))
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        # Sparse attention: check if this tile can be skipped
+        if USE_SPARSE:
+            S_row_max = tl.max(S, axis=1)
+            row_max_diff = S_row_max - M
+            skip_block = tl.max(row_max_diff - sparse_thr_ln) < 0.0
+        else:
+            skip_block = False
 
-        P = tl.exp(S - m_j[:, None])
-        l_j = tl.sum(P, axis=1)
-        alpha = tl.exp(M - m_j)
-
-        acc = acc * alpha[:, None]
-        L = L * alpha + l_j
-        M = m_j
-
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            V = tl.where(
-                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0
+        if not skip_block:
+            # V load deferred to after skip check to save bandwidth
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
             )
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+            else:
+                V = V_load
 
-        acc += tl.dot(P.to(V.dtype), V)
+            m_j = tl.maximum(M, tl.max(S, axis=1))
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+            P = tl.exp(S - m_j[:, None])
+            l_j = tl.sum(P, axis=1)
+            alpha = tl.exp(M - m_j)
+
+            acc = acc * alpha[:, None]
+            L = L * alpha + l_j
+            M = m_j
+
+            if SLIDING_WINDOW:
+                qpos_lo = q_block_local_idx * BLOCK_Q
+                V = tl.where(
+                    (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0
+                )
+
+            acc += tl.dot(P.to(V.dtype), V)
 
     acc = acc / L[:, None]
     if USE_FP8:
@@ -393,6 +412,8 @@ def kernel_unified_attention_3d(
     USE_MM_PREFIX: tl.constexpr,
     MAX_MM_RANGES: tl.constexpr,
     mm_prefix_range_ptr,
+    softmax_threshold=0.0,
+    USE_SPARSE: tl.constexpr = False,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -461,6 +482,13 @@ def kernel_unified_attention_3d(
 
     context_len = seq_len - cur_batch_query_len
 
+    # Sparse attention: compute per-row adaptive threshold in ln domain
+    if USE_SPARSE:
+        query_abs_pos_sparse = (context_len + query_pos).to(tl.float32)
+        seq_len_f = tl.maximum(seq_len.to(tl.float32), 1.0)
+        sparse_thr = softmax_threshold * (query_abs_pos_sparse + 1.0) / seq_len_f
+        sparse_thr_ln = tl.log(sparse_thr)  # shape [BLOCK_M]
+
     if USE_ALIBI_SLOPES:
         alibi_slope = tl.load(
             alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
@@ -528,19 +556,6 @@ def kernel_unified_attention_3d(
         else:
             K = K_load
 
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
-
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = seq_offset[None, :] <= query_abs_pos
 
@@ -596,24 +611,47 @@ def kernel_unified_attention_3d(
             )
             S += qq_bias
 
-        m_j = tl.maximum(M, tl.max(S, axis=1))
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        # Sparse attention: check if this tile can be skipped
+        if USE_SPARSE:
+            S_row_max = tl.max(S, axis=1)
+            row_max_diff = S_row_max - M
+            skip_block = tl.max(row_max_diff - sparse_thr_ln) < 0.0
+        else:
+            skip_block = False
 
-        P = tl.exp(S - m_j[:, None])
-        l_j = tl.sum(P, axis=1)
-        alpha = tl.exp(M - m_j)
-
-        acc = acc * alpha[:, None]
-        L = L * alpha + l_j
-        M = m_j
-
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            V = tl.where(
-                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0
+        if not skip_block:
+            # V load deferred to after skip check to save bandwidth
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
             )
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+            else:
+                V = V_load
 
-        acc += tl.dot(P.to(V.dtype), V)
+            m_j = tl.maximum(M, tl.max(S, axis=1))
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+            P = tl.exp(S - m_j[:, None])
+            l_j = tl.sum(P, axis=1)
+            alpha = tl.exp(M - m_j)
+
+            acc = acc * alpha[:, None]
+            L = L * alpha + l_j
+            M = m_j
+
+            if SLIDING_WINDOW:
+                qpos_lo = q_block_local_idx * BLOCK_Q
+                V = tl.where(
+                    (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0
+                )
+
+            acc += tl.dot(P.to(V.dtype), V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
@@ -757,6 +795,7 @@ def unified_attention(
     sinks=None,
     mm_prefix_range=None,
     use_alibi_sqrt=False,
+    softmax_threshold=None,
     # V3 new params - accepted but handled via fallback for non-standard cases
     kv_quant_mode=None,
     k_scale_cache=None,
@@ -825,6 +864,21 @@ def unified_attention(
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
+
+    # Sparse attention threshold
+    use_sparse = softmax_threshold is not None and softmax_threshold > 0.0
+    softmax_threshold_val = float(softmax_threshold) if use_sparse else 0.0
+
+    # Log sparse attention status once on first call
+    if not hasattr(unified_attention, '_logged_sparse'):
+        unified_attention._logged_sparse = True
+        if use_sparse:
+            logger.info(
+                "unified_attention: sparse attention ACTIVE (threshold=%.6f)",
+                softmax_threshold_val,
+            )
+        else:
+            logger.info("unified_attention: sparse attention INACTIVE")
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -910,6 +964,8 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            softmax_threshold=softmax_threshold_val,
+            USE_SPARSE=use_sparse,
             num_warps=2,
             num_stages=1,
         )
@@ -965,6 +1021,8 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            softmax_threshold=softmax_threshold_val,
+            USE_SPARSE=use_sparse,
             num_warps=2,
             num_stages=1,
         )
