@@ -3,6 +3,8 @@
 
 import os
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
@@ -28,6 +30,10 @@ if _SPARSE_THRESHOLD is not None:
     logger.info("Sparse attention enabled with threshold=%s", _SPARSE_THRESHOLD)
 else:
     logger.info("Sparse attention disabled")
+
+_USE_FLASH_PREFILL_ONE_SEQ = os.environ.get('VLLM_FL_USE_FLASH_PREFILL_ONE_SEQ', '0') == '1'
+if _USE_FLASH_PREFILL_ONE_SEQ:
+    logger.info("Flash prefill (single-seq) enabled via VLLM_FL_USE_FLASH_PREFILL_ONE_SEQ=1")
 
 
 class AttentionOptimizedBackend(TritonAttentionBackend):
@@ -123,6 +129,53 @@ class AttentionOptimizedImpl(TritonAttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+
+        # gfx936: the Hygon-built flash_attn 2.8.3 (FlashAttention-2) runs the
+        # prefill full-attention ~2.7-2.9x faster than this kernel's Triton 2D path
+        # (which only reaches ~18% of bf16 peak; flash_attn reaches ~45-51%). It is
+        # exact attention (lossless, no token shift). Use it for the prefill case
+        # only (max_query_len > 1); keep the tuned Triton 3D split-KV for pure decode.
+        # Opt-in via VLLM_FL_USE_FLASH_PREFILL_ONE_SEQ=1. Reads the same paged KV cache via
+        # block_table (k_cache/v_cache layout matches flash_attn's paged API).
+        # flash_attn's paged API requires block_size==64, but the hybrid model forces
+        # block_size=784 (>= mamba page). So instead gather the paged KV into a
+        # contiguous [seq_len, n_kv_heads, head] tensor (cheap, ~0.06ms) and call
+        # flash_attn_varlen WITHOUT block_table. Gated to a single sequence per step
+        # (concurrency=1, the competition setting). num_seqs = cu_seqlens_q len - 1.
+        if (
+            _USE_FLASH_PREFILL_ONE_SEQ
+            and max_seqlen_q > 1
+            and cu_seqlens_q.shape[0] == 2  # exactly one sequence in this step
+            and self.sinks is None
+            and mm_prefix_range_tensor is None
+            and self.alibi_slopes is None
+            and self.sliding_window == (-1, -1)
+            and not self.kv_cache_dtype.startswith("fp8")
+            and output_scale is None
+        ):
+            from flash_attn import flash_attn_varlen_func
+
+            bs = key_cache.shape[1]  # block_size
+            seq_len = int(seqused_k[0].item())
+            n_blk = (seq_len + bs - 1) // bs
+            blk = block_table[0, :n_blk]
+            k_g = key_cache[blk].reshape(-1, key_cache.shape[2], key_cache.shape[3])[:seq_len]
+            v_g = value_cache[blk].reshape(-1, value_cache.shape[2], value_cache.shape[3])[:seq_len]
+            cu_k = torch.tensor([0, seq_len], dtype=torch.int32, device=query.device)
+            o = flash_attn_varlen_func(
+                query[:num_actual_tokens],
+                k_g,
+                v_g,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+            dst = output[:num_actual_tokens]
+            dst.copy_(o.reshape(dst.shape))
+            return output
 
         # Use optimized unified_attention with split 2D/3D kernels
         from .ops.triton_unified_attention import (
