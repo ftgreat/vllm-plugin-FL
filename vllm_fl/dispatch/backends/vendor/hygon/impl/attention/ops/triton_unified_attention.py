@@ -763,10 +763,10 @@ def _get_tile_size(
     is_prefill: bool,
 ) -> int:
     if sliding_window == 1024 and head_size in (128, 256):
-        return 32
+        return 64 if is_prefill else 32
     if is_prefill:
-        return 32
-    return 32  # Hygon DCU gfx926: larger tile reduces loop iterations
+        return 64
+    return 32  # Hygon DCU gfx926: 3D decode keeps tile=32
 
 
 def unified_attention(
@@ -889,12 +889,18 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
-    BLOCK_M = (
+    BLOCK_M_2D = (
+        128 if num_queries_per_kv <= 128 else triton.next_power_of_2(num_queries_per_kv)
+    )
+    BLOCK_Q_2D = BLOCK_M_2D // num_queries_per_kv
+
+    BLOCK_M_3D = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    BLOCK_Q_3D = BLOCK_M_3D // num_queries_per_kv
 
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    total_num_q_blocks_2D = q.shape[0] // BLOCK_Q_2D + num_seqs
+    total_num_q_blocks_3D = q.shape[0] // BLOCK_Q_3D + num_seqs
 
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
     TILE_SIZE_PREFILL = _get_tile_size(
@@ -916,7 +922,7 @@ def unified_attention(
         or is_batch_invariant
     ):
         kernel_unified_attention_2d[
-            (total_num_q_blocks, num_kv_heads,)
+            (total_num_q_blocks_2D, num_kv_heads,)
         ](
             output_ptr=out,
             query_ptr=q,
@@ -962,14 +968,14 @@ def unified_attention(
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
+            BLOCK_Q=BLOCK_Q_2D,
             num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
+            BLOCK_M=BLOCK_M_2D,
             USE_FP8=output_scale is not None,
             softmax_threshold=softmax_threshold_val,
             USE_SPARSE=use_sparse,
-            num_warps=2,
-            num_stages=1,
+            num_warps=8,
+            num_stages=2,
         )
         if RECORDING_ENABLED and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
@@ -987,7 +993,7 @@ def unified_attention(
                 num_query_heads=num_query_heads, num_kv_heads=num_kv_heads,
                 num_queries_per_kv=num_queries_per_kv,
                 head_size=head_size, block_size=block_size,
-                BLOCK_M=BLOCK_M, BLOCK_Q=BLOCK_Q,
+                BLOCK_M=BLOCK_M_2D, BLOCK_Q=BLOCK_Q_2D,
                 TILE_SIZE=TILE_SIZE_PREFILL,
                 use_sparse=use_sparse,
                 sliding_window=(1 + window_size[0]),
@@ -1005,7 +1011,7 @@ def unified_attention(
     else:
         # 3D kernel for decode-only batches (performance optimized)
         kernel_unified_attention_3d[
-            (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
+            (total_num_q_blocks_3D, num_kv_heads, num_par_softmax_segments)
         ](
             segm_output_ptr=softmax_segm_output,
             segm_max_ptr=softmax_segm_max,
@@ -1050,9 +1056,9 @@ def unified_attention(
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
+            BLOCK_Q=BLOCK_Q_3D,
             num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
+            BLOCK_M=BLOCK_M_3D,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             softmax_threshold=softmax_threshold_val,
             USE_SPARSE=use_sparse,

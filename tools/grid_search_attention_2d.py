@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # Copyright (c) 2025 BAAI. All rights reserved.
 # Grid search over tunable knobs for kernel_unified_attention_2d.
+# Supports multi-GPU: configs are evenly distributed across all visible GPUs.
 #
 # Usage:
-#   # Default: sweep each knob independently (~40 configs)
+#   # Default: sweep each knob independently (~40 configs), all GPUs
 #   python tools/grid_search_attention_2d.py --data-dir /path/to/saved_samples
+#
+#   # Use specific GPUs
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 python tools/grid_search_attention_2d.py \
+#       --data-dir /path/to/saved_samples
 #
 #   # Sweep specific knobs
 #   python tools/grid_search_attention_2d.py --data-dir /path/to/saved_samples \
@@ -14,39 +19,39 @@
 #   python tools/grid_search_attention_2d.py --data-dir /path/to/saved_samples \
 #       --grid \
 #       --sweep TILE_SIZE=32,64,128 \
-#       --sweep num_warps=2,4
+#       --sweep num_warps=2,4 \
+#       --sweep matrix_instr_nonkdim=0,16 \
+#       --sweep kpack=1,2
 
 import argparse
 import csv
 import itertools
+import math
+import multiprocessing as mp
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-import torch
-
-# Add project root to path
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_PROJECT_ROOT))
-
-from vllm_fl.dispatch.backends.vendor.hygon.impl.attention.ops.triton_unified_attention import (
-    kernel_unified_attention_2d,
-)
-from vllm.platforms import current_platform
-from vllm.triton_utils import triton
-
-float8_info = torch.finfo(current_platform.fp8_dtype())
 
 # ═══════════════════════════════════════════════════════════════════
 # Default knob values (matching production defaults)
 # ═══════════════════════════════════════════════════════════════════
 DEFAULTS = {
     # Tiling (constexpr — triggers recompilation)
-    "TILE_SIZE": 32,
-    "BLOCK_M": 16,
+    "TILE_SIZE": 64,
+    "BLOCK_M": 128,
     # Triton launch params
-    "num_warps": 2,
-    "num_stages": 1,
+    "num_warps": 8,
+    "num_stages": 2,
+    # HCU compiler extra_kargs (defaults from HIPOptions in compiler_hcu.py)
+    "matrix_instr_nonkdim": 0,
+    "kpack": 1,
+    "waves_per_eu": 1,
+    "schedule_hint": "none",
+    "sched_latency": "none",
+    "mmac_layout_force": -1,
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -57,10 +62,33 @@ SEARCH_SPACE = {
     "BLOCK_M": [16, 32, 64, 128, 256],
     "num_warps": [1, 2, 4, 8],
     "num_stages": [1, 2, 4],
+    "matrix_instr_nonkdim": [0, 16, 32],
+    "kpack": [1, 2],
+    "waves_per_eu": [0, 1, 2, 4],
+    "schedule_hint": ["none", "attention", "memory-bound-attention"],
+    "sched_latency": ["none", "mmac5-ds10", "mmac5-ds6"],
+    "mmac_layout_force": [-1, 0, 1, 2, 3, 4],
+}
+
+# Knobs passed as Triton HCU compiler extra_kargs
+EXTRA_KARG_KNOBS = {
+    "matrix_instr_nonkdim", "kpack", "waves_per_eu",
+    "schedule_hint", "sched_latency", "mmac_layout_force",
+}
+
+# Defaults that mean "no-op" / "auto" (from HIPOptions in compiler_hcu.py)
+_EXTRA_KARG_DEFAULTS = {
+    "matrix_instr_nonkdim": 0,
+    "kpack": 1,
+    "waves_per_eu": 1,
+    "schedule_hint": "none",
+    "sched_latency": "none",
+    "mmac_layout_force": -1,
 }
 
 WARMUP_ITERS = 3
 TIMED_ITERS = 10
+CONFIG_TIMEOUT = 900  # seconds (15 minutes)
 
 
 def load_samples(data_dir: str, max_samples: int = None) -> List[Dict[str, Any]]:
@@ -75,7 +103,6 @@ def load_samples(data_dir: str, max_samples: int = None) -> List[Dict[str, Any]]
     for pt_file in files:
         sample = torch.load(pt_file, map_location="cpu", weights_only=False)
         samples.append(sample)
-    print(f"Loaded {len(samples)} samples from {data_dir}")
     return samples
 
 
@@ -85,6 +112,8 @@ def prepare_kernel_args(
     """Prepare kernel launch arguments from a sample + config.
 
     Returns (grid, kernel_kwargs, out_tensor).
+    kernel_kwargs includes all named kernel args, launch params,
+    and extra_kargs.
     """
     q = sample["q"].cuda()
     k_compact = sample["k_compact"].cuda()
@@ -196,6 +225,12 @@ def prepare_kernel_args(
     kwargs["num_warps"] = config["num_warps"]
     kwargs["num_stages"] = config["num_stages"]
 
+    # HCU compiler extra_kargs (skip no-op defaults to avoid needless recompilation)
+    for knob in EXTRA_KARG_KNOBS:
+        val = config.get(knob)
+        if val is not None and val != _EXTRA_KARG_DEFAULTS.get(knob):
+            kwargs[knob] = val
+
     return grid, kwargs, out
 
 
@@ -204,12 +239,16 @@ def benchmark_config(
     config: Dict[str, Any],
     warmup_iters: int,
     timed_iters: int,
+    timeout: float = CONFIG_TIMEOUT,
 ) -> Tuple[float, str]:
     """Benchmark one config across all samples. Returns (avg_us, status)."""
     total_us = 0.0
     n_ok = 0
+    t0 = time.monotonic()
 
     for sample in samples:
+        if time.monotonic() - t0 > timeout:
+            return float("nan"), f"timeout: exceeded {timeout:.0f}s"
         try:
             grid, kwargs, out = prepare_kernel_args(sample, config)
 
@@ -307,9 +346,63 @@ def config_desc(config: Dict[str, Any]) -> str:
     return ", ".join(diffs) if diffs else "(baseline)"
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Multi-GPU worker
+# ═══════════════════════════════════════════════════════════════════
+
+def _gpu_worker(
+    gpu_id: int,
+    config_indices: List[int],
+    configs: List[Dict[str, Any]],
+    data_dir: str,
+    max_samples: int,
+    warmup_iters: int,
+    timed_iters: int,
+    timeout: float,
+    result_queue: mp.Queue,
+):
+    """Worker process: set device, load data, benchmark assigned configs."""
+    # Each worker only sees one GPU
+    os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    # Heavy imports after setting device visibility
+    import torch as _torch
+    _torch.cuda.set_device(0)  # device 0 within this process's view
+
+    global torch, triton, kernel_unified_attention_2d, float8_info
+    torch = _torch
+
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+    from vllm_fl.dispatch.backends.vendor.hygon.impl.attention.ops.triton_unified_attention import (
+        kernel_unified_attention_2d as _kernel,
+    )
+    from vllm.platforms import current_platform
+    from vllm.triton_utils import triton as _triton
+
+    kernel_unified_attention_2d = _kernel
+    triton = _triton
+    float8_info = _torch.finfo(current_platform.fp8_dtype())
+
+    samples = load_samples(data_dir, max_samples)
+    print(f"[GPU {gpu_id}] Loaded {len(samples)} samples, {len(config_indices)} configs to run")
+
+    for ci in config_indices:
+        config = configs[ci]
+        desc = config_desc(config)
+        avg_us, status = benchmark_config(samples, config, warmup_iters, timed_iters, timeout)
+        if status == "ok":
+            print(f"[GPU {gpu_id}] [{ci+1}/{len(configs)}] {desc} ... {avg_us:.1f} us")
+        else:
+            print(f"[GPU {gpu_id}] [{ci+1}/{len(configs)}] {desc} ... FAILED: {status}")
+        result_queue.put((ci, config, avg_us, status))
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Grid search for kernel_unified_attention_2d knobs",
+        description="Grid search for kernel_unified_attention_2d knobs (multi-GPU)",
     )
     parser.add_argument(
         "--data-dir", required=True, help="Directory with saved .pt samples",
@@ -326,9 +419,15 @@ def main():
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=WARMUP_ITERS)
     parser.add_argument("--iters", type=int, default=TIMED_ITERS)
+    parser.add_argument(
+        "--gpus", type=str, default=None,
+        help="Comma-separated GPU IDs (default: all visible GPUs)",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=CONFIG_TIMEOUT,
+        help=f"Per-config timeout in seconds (default: {CONFIG_TIMEOUT})",
+    )
     args = parser.parse_args()
-
-    samples = load_samples(args.data_dir, args.max_samples)
 
     # Build configs
     if args.sweep:
@@ -340,32 +439,70 @@ def main():
     else:
         configs = generate_configs_independent()
 
+    # Determine GPUs
+    if args.gpus is not None:
+        gpu_ids = [int(g) for g in args.gpus.split(",")]
+    else:
+        import torch as _torch
+        gpu_ids = list(range(_torch.cuda.device_count()))
+
+    num_gpus = len(gpu_ids)
+    if num_gpus == 0:
+        print("ERROR: No GPUs available.")
+        sys.exit(1)
+
     print(
-        f"Benchmarking {len(configs)} configs × {len(samples)} samples "
-        f"({args.warmup} warmup + {args.iters} timed iters each)"
+        f"Benchmarking {len(configs)} configs on {num_gpus} GPU(s) {gpu_ids}\n"
+        f"  ({args.warmup} warmup + {args.iters} timed iters each, "
+        f"timeout {args.timeout:.0f}s per config)"
     )
     print()
 
+    # Distribute configs round-robin across GPUs
+    gpu_config_indices: Dict[int, List[int]] = {gid: [] for gid in gpu_ids}
+    for ci in range(len(configs)):
+        gid = gpu_ids[ci % num_gpus]
+        gpu_config_indices[gid].append(ci)
+
+    # Launch workers
+    mp.set_start_method("spawn", force=True)
+    result_queue = mp.Queue()
+    workers = []
+    for gid in gpu_ids:
+        p = mp.Process(
+            target=_gpu_worker,
+            args=(
+                gid,
+                gpu_config_indices[gid],
+                configs,
+                args.data_dir,
+                args.max_samples,
+                args.warmup,
+                args.iters,
+                args.timeout,
+                result_queue,
+            ),
+        )
+        p.start()
+        workers.append(p)
+
+    # Collect results
+    results_by_idx = {}
+    total_expected = len(configs)
+    while len(results_by_idx) < total_expected:
+        ci, config, avg_us, status = result_queue.get()
+        results_by_idx[ci] = (config, avg_us, status)
+
+    for p in workers:
+        p.join()
+
+    # Sort by original config index for deterministic output
     knob_names = list(DEFAULTS.keys())
     fieldnames = knob_names + ["avg_time_us", "status"]
     results = []
-
-    for ci, config in enumerate(configs):
-        desc = config_desc(config)
-        print(
-            f"[{ci+1}/{len(configs)}] {desc} ... ", end="", flush=True,
-        )
-
-        avg_us, status = benchmark_config(
-            samples, config, args.warmup, args.iters,
-        )
-
-        if status == "ok":
-            print(f"{avg_us:.1f} us")
-        else:
-            print(f"FAILED: {status}")
-
-        row = {k: config[k] for k in knob_names}
+    for ci in range(len(configs)):
+        config, avg_us, status = results_by_idx[ci]
+        row = {k: config.get(k, DEFAULTS.get(k)) for k in knob_names}
         row["avg_time_us"] = avg_us
         row["status"] = status
         results.append(row)
