@@ -1081,7 +1081,7 @@ def unified_attention(
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
+            BLOCK_Q=BLOCK_Q_3D,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
         )
