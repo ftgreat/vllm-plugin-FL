@@ -2,6 +2,7 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
 # Grid search over tunable knobs for kernel_unified_attention_2d.
 # Supports multi-GPU: configs are evenly distributed across all visible GPUs.
+# Supports both full-tensor samples and lightweight (shape-only) samples.
 #
 # Usage:
 #   # Default: sweep each knob independently (~40 configs), all GPUs
@@ -22,6 +23,10 @@
 #       --sweep num_warps=2,4 \
 #       --sweep matrix_instr_nonkdim=0,16 \
 #       --sweep kpack=1,2
+#
+#   # Filter by batch size and sequence length
+#   python tools/grid_search_attention_2d.py --data-dir /path/to/saved_samples \
+#       --filter-bs 64 --filter-max-seqlen-range 1000,5000
 
 import argparse
 import csv
@@ -90,6 +95,15 @@ WARMUP_ITERS = 3
 TIMED_ITERS = 10
 CONFIG_TIMEOUT = 900  # seconds (15 minutes)
 
+# ═══════════════════════════════════════════════════════════════════
+# Dtype mapping for lightweight samples
+# ═══════════════════════════════════════════════════════════════════
+_DTYPE_MAP = {
+    "torch.bfloat16": "bfloat16",
+    "torch.float16": "float16",
+    "torch.float32": "float32",
+}
+
 
 def load_samples(data_dir: str, max_samples: int = None) -> List[Dict[str, Any]]:
     """Load all .pt sample files from directory."""
@@ -106,15 +120,156 @@ def load_samples(data_dir: str, max_samples: int = None) -> List[Dict[str, Any]]
     return samples
 
 
-def prepare_kernel_args(
-    sample: Dict[str, Any], config: Dict[str, Any],
-) -> Tuple[tuple, dict, dict]:
-    """Prepare kernel launch arguments from a sample + config.
+def filter_samples(
+    samples: List[Dict[str, Any]],
+    filter_bs: int = None,
+    filter_bs_range: str = None,
+    filter_max_seqlen_range: str = None,
+) -> List[Dict[str, Any]]:
+    """Filter samples by num_seqs and max_seq_len."""
+    filtered = samples
+    if filter_bs is not None:
+        filtered = [s for s in filtered if s["num_seqs"] == filter_bs]
+    if filter_bs_range is not None:
+        lo, hi = map(int, filter_bs_range.split(","))
+        filtered = [s for s in filtered if lo <= s["num_seqs"] <= hi]
+    if filter_max_seqlen_range is not None:
+        lo, hi = map(int, filter_max_seqlen_range.split(","))
+        filtered = [s for s in filtered
+                    if lo <= s.get("max_seq_len", int(s["seqused_k"].max().item())) <= hi]
+    return filtered
 
-    Returns (grid, kernel_kwargs, out_tensor).
-    kernel_kwargs includes all named kernel args, launch params,
-    and extra_kargs.
-    """
+
+def _build_sequential_block_table(seqused_k, block_size, device):
+    """Build a sequential block_table mapping for synthetic data."""
+    num_seqs = seqused_k.shape[0]
+    num_blocks_per_seq = (seqused_k + block_size - 1) // block_size
+    max_blocks = int(num_blocks_per_seq.max().item())
+    total_blocks = int(num_blocks_per_seq.sum().item())
+
+    block_table = torch.zeros(num_seqs, max_blocks, dtype=torch.int32, device=device)
+    offset = 0
+    for i in range(num_seqs):
+        n = int(num_blocks_per_seq[i].item())
+        block_table[i, :n] = torch.arange(offset, offset + n, dtype=torch.int32, device=device)
+        offset += n
+    return block_table, total_blocks
+
+
+def prepare_kernel_args_lite(
+    sample: Dict[str, Any], config: Dict[str, Any],
+) -> Tuple[tuple, dict, "torch.Tensor"]:
+    """Prepare kernel args from a lightweight (shape-only) sample using synthetic data."""
+    # Parse dtype
+    dtype_str = sample["q_dtype"]
+    dtype = getattr(torch, _DTYPE_MAP.get(dtype_str, dtype_str.replace("torch.", "")))
+
+    num_query_heads = sample["num_query_heads"]
+    num_kv_heads = sample["num_kv_heads"]
+    num_queries_per_kv = sample["num_queries_per_kv"]
+    head_size = sample["head_size"]
+    block_size = sample["block_size"]
+    num_seqs = sample["num_seqs"]
+    softmax_scale = sample["softmax_scale"]
+    softcap = sample["softcap"]
+    output_scale = sample.get("output_scale")
+    softmax_threshold_val = sample["softmax_threshold_val"]
+    use_qq_bias = sample["USE_QQ_BIAS"]
+
+    seqused_k = sample["seqused_k"].cuda()
+    cu_seqlens_q = sample["cu_seqlens_q"].cuda()
+
+    # Construct synthetic tensors from recorded shapes
+    q_shape = tuple(sample["q_shape"])
+    q = torch.randn(q_shape, dtype=dtype, device="cuda")
+    out = torch.empty_like(q)
+
+    # Build sequential block_table and KV cache
+    block_table, total_blocks = _build_sequential_block_table(seqused_k, block_size, q.device)
+    k_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda")
+    v_cache = torch.randn_like(k_cache)
+
+    # Tiling from config
+    TILE_SIZE = config["TILE_SIZE"]
+    BLOCK_M = config["BLOCK_M"]
+    BLOCK_Q = max(BLOCK_M // num_queries_per_kv, 1)
+
+    # Recompute grid
+    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    grid = (total_num_q_blocks, num_kv_heads)
+
+    kwargs = dict(
+        output_ptr=out,
+        query_ptr=q,
+        key_cache_ptr=k_cache,
+        value_cache_ptr=v_cache,
+        sink_ptr=None,
+        block_tables_ptr=block_table,
+        seq_lens_ptr=seqused_k,
+        alibi_slopes_ptr=None,
+        qq_bias_ptr=None,
+        scale=softmax_scale,
+        k_scale=1.0,
+        v_scale=1.0,
+        out_scale=1.0 / output_scale if output_scale is not None else 1.0,
+        softcap=softcap,
+        num_query_heads=num_query_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        block_table_stride=block_table.stride(0),
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        qq_bias_stride_0=0,
+        BLOCK_SIZE=block_size,
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+        USE_ALIBI_SLOPES=sample["USE_ALIBI_SLOPES"],
+        USE_ALIBI_SQRT=sample["USE_ALIBI_SQRT"],
+        USE_QQ_BIAS=use_qq_bias,
+        USE_SOFTCAP=sample["USE_SOFTCAP"],
+        USE_SINKS=sample["USE_SINKS"],
+        USE_MM_PREFIX=sample["USE_MM_PREFIX"],
+        MAX_MM_RANGES=sample["MAX_MM_RANGES"],
+        mm_prefix_range_ptr=None,
+        SLIDING_WINDOW=sample["sliding_window"],
+        stride_k_cache_0=k_cache.stride(0),
+        stride_k_cache_1=k_cache.stride(1),
+        stride_k_cache_2=k_cache.stride(2),
+        stride_k_cache_3=k_cache.stride(3),
+        stride_v_cache_0=v_cache.stride(0),
+        stride_v_cache_1=v_cache.stride(1),
+        stride_v_cache_2=v_cache.stride(2),
+        stride_v_cache_3=v_cache.stride(3),
+        query_start_len_ptr=cu_seqlens_q,
+        BLOCK_Q=BLOCK_Q,
+        num_seqs=num_seqs,
+        BLOCK_M=BLOCK_M,
+        USE_FP8=sample["USE_FP8"],
+        FP8_MIN=float8_info.min,
+        FP8_MAX=float8_info.max,
+        softmax_threshold=softmax_threshold_val,
+        USE_SPARSE=sample["USE_SPARSE"],
+    )
+
+    # Launch params
+    kwargs["num_warps"] = config["num_warps"]
+    kwargs["num_stages"] = config["num_stages"]
+
+    # HCU compiler extra_kargs
+    for knob in EXTRA_KARG_KNOBS:
+        val = config.get(knob)
+        if val is not None and val != _EXTRA_KARG_DEFAULTS.get(knob):
+            kwargs[knob] = val
+
+    return grid, kwargs, out
+
+
+def prepare_kernel_args_full(
+    sample: Dict[str, Any], config: Dict[str, Any],
+) -> Tuple[tuple, dict, "torch.Tensor"]:
+    """Prepare kernel launch arguments from a full-tensor sample."""
     q = sample["q"].cuda()
     k_compact = sample["k_compact"].cuda()
     v_compact = sample["v_compact"].cuda()
@@ -234,6 +389,15 @@ def prepare_kernel_args(
     return grid, kwargs, out
 
 
+def prepare_kernel_args(
+    sample: Dict[str, Any], config: Dict[str, Any],
+) -> Tuple[tuple, dict, "torch.Tensor"]:
+    """Dispatch to lite or full prepare based on sample format."""
+    if sample.get("_lite", False):
+        return prepare_kernel_args_lite(sample, config)
+    return prepare_kernel_args_full(sample, config)
+
+
 def benchmark_config(
     samples: List[Dict[str, Any]],
     config: Dict[str, Any],
@@ -241,8 +405,8 @@ def benchmark_config(
     timed_iters: int,
     timeout: float = CONFIG_TIMEOUT,
 ) -> Tuple[float, str]:
-    """Benchmark one config across all samples. Returns (avg_us, status)."""
-    total_us = 0.0
+    """Benchmark one config across all samples. Returns (geo_mean_us, status)."""
+    log_sum = 0.0
     n_ok = 0
     t0 = time.monotonic()
 
@@ -269,14 +433,15 @@ def benchmark_config(
 
             elapsed_ms = start.elapsed_time(end)
             avg_us = (elapsed_ms / timed_iters) * 1000.0
-            total_us += avg_us
+            log_sum += math.log(avg_us)
             n_ok += 1
         except Exception as e:
             return float("nan"), f"error: {e}"
 
     if n_ok == 0:
         return float("nan"), "error: no samples succeeded"
-    return total_us / n_ok, "ok"
+    geo_mean_us = math.exp(log_sum / n_ok)
+    return geo_mean_us, "ok"
 
 
 def generate_configs_independent() -> List[Dict[str, Any]]:
@@ -356,6 +521,9 @@ def _gpu_worker(
     configs: List[Dict[str, Any]],
     data_dir: str,
     max_samples: int,
+    filter_bs: int,
+    filter_bs_range: str,
+    filter_max_seqlen_range: str,
     warmup_iters: int,
     timed_iters: int,
     timeout: float,
@@ -387,17 +555,26 @@ def _gpu_worker(
     float8_info = _torch.finfo(current_platform.fp8_dtype())
 
     samples = load_samples(data_dir, max_samples)
-    print(f"[GPU {gpu_id}] Loaded {len(samples)} samples, {len(config_indices)} configs to run")
+    samples = filter_samples(samples, filter_bs, filter_bs_range, filter_max_seqlen_range)
+
+    if not samples:
+        print(f"[GPU {gpu_id}] No samples after filtering, skipping")
+        for ci in config_indices:
+            result_queue.put((ci, configs[ci], float("nan"), "no samples after filtering"))
+        return
+
+    print(f"[GPU {gpu_id}] Loaded {len(samples)} samples (after filtering), "
+          f"{len(config_indices)} configs to run")
 
     for ci in config_indices:
         config = configs[ci]
         desc = config_desc(config)
-        avg_us, status = benchmark_config(samples, config, warmup_iters, timed_iters, timeout)
+        geo_mean_us, status = benchmark_config(samples, config, warmup_iters, timed_iters, timeout)
         if status == "ok":
-            print(f"[GPU {gpu_id}] [{ci+1}/{len(configs)}] {desc} ... {avg_us:.1f} us")
+            print(f"[GPU {gpu_id}] [{ci+1}/{len(configs)}] {desc} ... {geo_mean_us:.1f} us (geo_mean)")
         else:
             print(f"[GPU {gpu_id}] [{ci+1}/{len(configs)}] {desc} ... FAILED: {status}")
-        result_queue.put((ci, config, avg_us, status))
+        result_queue.put((ci, config, geo_mean_us, status))
 
 
 def main():
@@ -427,6 +604,19 @@ def main():
         "--timeout", type=float, default=CONFIG_TIMEOUT,
         help=f"Per-config timeout in seconds (default: {CONFIG_TIMEOUT})",
     )
+    # ── Filtering ──
+    parser.add_argument(
+        "--filter-bs", type=int, default=None,
+        help="Only benchmark samples with num_seqs==N",
+    )
+    parser.add_argument(
+        "--filter-bs-range", type=str, default=None,
+        help="Filter num_seqs in range, e.g. '1,16'",
+    )
+    parser.add_argument(
+        "--filter-max-seqlen-range", type=str, default=None,
+        help="Filter max_seq_len in range, e.g. '1000,5000'",
+    )
     args = parser.parse_args()
 
     # Build configs
@@ -451,12 +641,22 @@ def main():
         print("ERROR: No GPUs available.")
         sys.exit(1)
 
+    filter_desc = []
+    if args.filter_bs is not None:
+        filter_desc.append(f"num_seqs=={args.filter_bs}")
+    if args.filter_bs_range is not None:
+        filter_desc.append(f"num_seqs in [{args.filter_bs_range}]")
+    if args.filter_max_seqlen_range is not None:
+        filter_desc.append(f"max_seq_len in [{args.filter_max_seqlen_range}]")
+    filter_str = f"  Filters: {', '.join(filter_desc)}\n" if filter_desc else ""
+
     print(
         f"Benchmarking {len(configs)} configs on {num_gpus} GPU(s) {gpu_ids}\n"
         f"  ({args.warmup} warmup + {args.iters} timed iters each, "
-        f"timeout {args.timeout:.0f}s per config)"
+        f"timeout {args.timeout:.0f}s per config)\n"
+        f"  Metric: geometric mean across samples\n"
+        f"{filter_str}"
     )
-    print()
 
     # Distribute configs round-robin across GPUs
     gpu_config_indices: Dict[int, List[int]] = {gid: [] for gid in gpu_ids}
@@ -477,6 +677,9 @@ def main():
                 configs,
                 args.data_dir,
                 args.max_samples,
+                args.filter_bs,
+                args.filter_bs_range,
+                args.filter_max_seqlen_range,
                 args.warmup,
                 args.iters,
                 args.timeout,
@@ -490,20 +693,20 @@ def main():
     results_by_idx = {}
     total_expected = len(configs)
     while len(results_by_idx) < total_expected:
-        ci, config, avg_us, status = result_queue.get()
-        results_by_idx[ci] = (config, avg_us, status)
+        ci, config, geo_mean_us, status = result_queue.get()
+        results_by_idx[ci] = (config, geo_mean_us, status)
 
     for p in workers:
         p.join()
 
     # Sort by original config index for deterministic output
     knob_names = list(DEFAULTS.keys())
-    fieldnames = knob_names + ["avg_time_us", "status"]
+    fieldnames = knob_names + ["geo_mean_us", "status"]
     results = []
     for ci in range(len(configs)):
-        config, avg_us, status = results_by_idx[ci]
+        config, geo_mean_us, status = results_by_idx[ci]
         row = {k: config.get(k, DEFAULTS.get(k)) for k in knob_names}
-        row["avg_time_us"] = avg_us
+        row["geo_mean_us"] = geo_mean_us
         row["status"] = status
         results.append(row)
 
@@ -515,13 +718,13 @@ def main():
     print(f"\nResults written to {args.output}")
 
     # Print Top-10
-    print("\n=== Top 10 configs (by avg time across samples) ===")
+    print("\n=== Top 10 configs (by geometric mean time across samples) ===")
     ok_results = [r for r in results if r["status"] == "ok"]
-    ok_results.sort(key=lambda r: r["avg_time_us"])
+    ok_results.sort(key=lambda r: r["geo_mean_us"])
     for i, row in enumerate(ok_results[:10]):
         cfg = {k: row[k] for k in knob_names}
         desc = config_desc(cfg)
-        print(f"  #{i+1}: {row['avg_time_us']:.1f} us  —  {desc}")
+        print(f"  #{i+1}: {row['geo_mean_us']:.1f} us  —  {desc}")
 
     if not ok_results:
         print("  (no successful configs)")
