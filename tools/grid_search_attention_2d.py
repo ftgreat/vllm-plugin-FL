@@ -93,7 +93,7 @@ _EXTRA_KARG_DEFAULTS = {
 
 WARMUP_ITERS = 3
 TIMED_ITERS = 10
-KERNEL_TIMEOUT_US = 500_000  # per-kernel-invocation timeout in microseconds (500ms)
+KERNEL_TIMEOUT_US = 10_000_000  # per-kernel-invocation timeout in microseconds (10s)
 
 # ═══════════════════════════════════════════════════════════════════
 # Dtype mapping for lightweight samples
