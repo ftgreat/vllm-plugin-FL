@@ -713,19 +713,33 @@ def main():
         p.start()
         workers.append(p)
 
-    # Collect results
+    # Collect results and write incrementally
+    knob_names = list(DEFAULTS.keys())
+    fieldnames = knob_names + ["geo_mean_us", "status"]
     results_by_idx = {}
     total_expected = len(configs)
+
+    # Write CSV header immediately
+    with open(args.output, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
     while len(results_by_idx) < total_expected:
         ci, config, geo_mean_us, status = result_queue.get()
         results_by_idx[ci] = (config, geo_mean_us, status)
 
+        # Append this result to CSV immediately
+        row = {k: config.get(k, DEFAULTS.get(k)) for k in knob_names}
+        row["geo_mean_us"] = geo_mean_us
+        row["status"] = status
+        with open(args.output, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writerow(row)
+
     for p in workers:
         p.join()
 
-    # Sort by original config index for deterministic output
-    knob_names = list(DEFAULTS.keys())
-    fieldnames = knob_names + ["geo_mean_us", "status"]
+    # Build sorted results for summary
     results = []
     for ci in range(len(configs)):
         config, geo_mean_us, status = results_by_idx[ci]
@@ -734,12 +748,7 @@ def main():
         row["status"] = status
         results.append(row)
 
-    # Write CSV
-    with open(args.output, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"\nResults written to {args.output}")
+    print(f"\nAll {total_expected} configs done. Results in {args.output}")
 
     # Print Top-10
     print("\n=== Top 10 configs (by geometric mean time across samples) ===")
