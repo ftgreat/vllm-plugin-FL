@@ -34,6 +34,7 @@ import itertools
 import math
 import multiprocessing as mp
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -533,6 +534,7 @@ def _gpu_worker(
     filter_bs: int,
     filter_bs_range: str,
     filter_max_seqlen_range: str,
+    sample_n: int,
     warmup_iters: int,
     timed_iters: int,
     kernel_timeout_us: float,
@@ -565,6 +567,11 @@ def _gpu_worker(
 
     samples = load_samples(data_dir, max_samples)
     samples = filter_samples(samples, filter_bs, filter_bs_range, filter_max_seqlen_range)
+
+    # Random subsampling
+    if sample_n is not None and len(samples) > sample_n:
+        random.seed(42)  # deterministic across GPUs
+        samples = random.sample(samples, sample_n)
 
     if not samples:
         print(f"[GPU {gpu_id}] No samples after filtering, skipping")
@@ -625,6 +632,10 @@ def main():
     parser.add_argument(
         "--filter-max-seqlen-range", type=str, default=None,
         help="Filter max_seq_len in range, e.g. '1000,5000'",
+    )
+    parser.add_argument(
+        "--sample-n", type=int, default=None,
+        help="Randomly sample N samples after filtering (for large datasets)",
     )
     args = parser.parse_args()
 
@@ -689,6 +700,7 @@ def main():
                 args.filter_bs,
                 args.filter_bs_range,
                 args.filter_max_seqlen_range,
+                args.sample_n,
                 args.warmup,
                 args.iters,
                 args.timeout,
