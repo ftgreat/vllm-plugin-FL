@@ -445,9 +445,12 @@ def benchmark_config(
 
 
 def generate_configs_independent() -> List[Dict[str, Any]]:
-    """Sweep each knob independently (default mode). ~40 configs."""
+    """Sweep each knob independently (default mode).
+    Only sweeps tiling/launch params, excludes HCU compiler knobs."""
     configs = [dict(DEFAULTS)]  # baseline
     for knob, values in SEARCH_SPACE.items():
+        if knob in EXTRA_KARG_KNOBS:
+            continue
         for val in values:
             if val == DEFAULTS[knob]:
                 continue
