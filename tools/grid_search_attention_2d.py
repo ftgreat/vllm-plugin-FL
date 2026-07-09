@@ -93,7 +93,7 @@ _EXTRA_KARG_DEFAULTS = {
 
 WARMUP_ITERS = 3
 TIMED_ITERS = 10
-CONFIG_TIMEOUT = 900  # seconds (15 minutes)
+KERNEL_TIMEOUT_US = 500_000  # per-kernel-invocation timeout in microseconds (500ms)
 
 # ═══════════════════════════════════════════════════════════════════
 # Dtype mapping for lightweight samples
@@ -403,16 +403,17 @@ def benchmark_config(
     config: Dict[str, Any],
     warmup_iters: int,
     timed_iters: int,
-    timeout: float = CONFIG_TIMEOUT,
+    kernel_timeout_us: float = KERNEL_TIMEOUT_US,
 ) -> Tuple[float, str]:
-    """Benchmark one config across all samples. Returns (geo_mean_us, status)."""
+    """Benchmark one config across all samples. Returns (geo_mean_us, status).
+
+    kernel_timeout_us: if any single kernel invocation exceeds this threshold,
+    the config is considered timed out.
+    """
     log_sum = 0.0
     n_ok = 0
-    t0 = time.monotonic()
 
     for sample in samples:
-        if time.monotonic() - t0 > timeout:
-            return float("nan"), f"timeout: exceeded {timeout:.0f}s"
         try:
             grid, kwargs, out = prepare_kernel_args(sample, config)
 
@@ -433,6 +434,11 @@ def benchmark_config(
 
             elapsed_ms = start.elapsed_time(end)
             avg_us = (elapsed_ms / timed_iters) * 1000.0
+
+            # Per-invocation timeout check
+            if avg_us > kernel_timeout_us:
+                return float("nan"), f"timeout: avg {avg_us:.0f}us > {kernel_timeout_us:.0f}us limit"
+
             log_sum += math.log(avg_us)
             n_ok += 1
         except Exception as e:
@@ -529,7 +535,7 @@ def _gpu_worker(
     filter_max_seqlen_range: str,
     warmup_iters: int,
     timed_iters: int,
-    timeout: float,
+    kernel_timeout_us: float,
     result_queue: mp.Queue,
 ):
     """Worker process: set device, load data, benchmark assigned configs."""
@@ -572,7 +578,7 @@ def _gpu_worker(
     for ci in config_indices:
         config = configs[ci]
         desc = config_desc(config)
-        geo_mean_us, status = benchmark_config(samples, config, warmup_iters, timed_iters, timeout)
+        geo_mean_us, status = benchmark_config(samples, config, warmup_iters, timed_iters, kernel_timeout_us)
         if status == "ok":
             print(f"[GPU {gpu_id}] [{ci+1}/{len(configs)}] {desc} ... {geo_mean_us:.1f} us (geo_mean)")
         else:
@@ -604,8 +610,8 @@ def main():
         help="Comma-separated GPU IDs (default: all visible GPUs)",
     )
     parser.add_argument(
-        "--timeout", type=float, default=CONFIG_TIMEOUT,
-        help=f"Per-config timeout in seconds (default: {CONFIG_TIMEOUT})",
+        "--timeout", type=float, default=KERNEL_TIMEOUT_US,
+        help=f"Per-kernel-invocation timeout in microseconds (default: {KERNEL_TIMEOUT_US})",
     )
     # ── Filtering ──
     parser.add_argument(
@@ -656,7 +662,7 @@ def main():
     print(
         f"Benchmarking {len(configs)} configs on {num_gpus} GPU(s) {gpu_ids}\n"
         f"  ({args.warmup} warmup + {args.iters} timed iters each, "
-        f"timeout {args.timeout:.0f}s per config)\n"
+        f"kernel timeout {args.timeout:.0f}us per invocation)\n"
         f"  Metric: geometric mean across samples\n"
         f"{filter_str}"
     )
