@@ -678,10 +678,13 @@ def main():
         f"{filter_str}"
     )
 
-    # Distribute configs round-robin across GPUs
+    # Shuffle and distribute configs across GPUs
+    shuffled_indices = list(range(len(configs)))
+    random.seed(0)
+    random.shuffle(shuffled_indices)
     gpu_config_indices: Dict[int, List[int]] = {gid: [] for gid in gpu_ids}
-    for ci in range(len(configs)):
-        gid = gpu_ids[ci % num_gpus]
+    for i, ci in enumerate(shuffled_indices):
+        gid = gpu_ids[i % num_gpus]
         gpu_config_indices[gid].append(ci)
 
     # Launch workers
