@@ -527,7 +527,7 @@ def config_desc(config: Dict[str, Any]) -> str:
 
 def _gpu_worker(
     gpu_id: int,
-    config_indices: List[int],
+    task_queue: mp.Queue,
     configs: List[Dict[str, Any]],
     data_dir: str,
     max_samples: int,
@@ -540,7 +540,7 @@ def _gpu_worker(
     kernel_timeout_us: float,
     result_queue: mp.Queue,
 ):
-    """Worker process: set device, load data, benchmark assigned configs."""
+    """Worker process: set device, load data, consume configs from task_queue."""
     # Each worker only sees one GPU
     os.environ["HIP_VISIBLE_DEVICES"] = str(gpu_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -575,22 +575,35 @@ def _gpu_worker(
 
     if not samples:
         print(f"[GPU {gpu_id}] No samples after filtering, skipping")
-        for ci in config_indices:
+        # Drain remaining tasks from queue
+        while True:
+            item = task_queue.get()
+            if item is None:
+                break
+            ci = item
             result_queue.put((ci, configs[ci], float("nan"), "no samples after filtering"))
         return
 
-    print(f"[GPU {gpu_id}] Loaded {len(samples)} samples (after filtering), "
-          f"{len(config_indices)} configs to run")
+    print(f"[GPU {gpu_id}] Loaded {len(samples)} samples, ready to consume tasks")
 
-    for ci in config_indices:
+    completed = 0
+    while True:
+        item = task_queue.get()
+        if item is None:
+            # Poison pill - no more tasks
+            break
+        ci = item
         config = configs[ci]
         desc = config_desc(config)
         geo_mean_us, status = benchmark_config(samples, config, warmup_iters, timed_iters, kernel_timeout_us)
+        completed += 1
         if status == "ok":
-            print(f"[GPU {gpu_id}] [{ci+1}/{len(configs)}] {desc} ... {geo_mean_us:.1f} us (geo_mean)")
+            print(f"[GPU {gpu_id}] [{completed}] {desc} ... {geo_mean_us:.1f} us (geo_mean)")
         else:
-            print(f"[GPU {gpu_id}] [{ci+1}/{len(configs)}] {desc} ... FAILED: {status}")
+            print(f"[GPU {gpu_id}] [{completed}] {desc} ... FAILED: {status}")
         result_queue.put((ci, config, geo_mean_us, status))
+
+    print(f"[GPU {gpu_id}] Done, completed {completed} configs")
 
 
 def main():
@@ -678,25 +691,29 @@ def main():
         f"{filter_str}"
     )
 
-    # Shuffle and distribute configs across GPUs
+    # Producer-consumer: put all configs into task queue
+    mp.set_start_method("spawn", force=True)
+    task_queue = mp.Queue()
+    result_queue = mp.Queue()
+
+    # Shuffle configs for varied workload distribution
     shuffled_indices = list(range(len(configs)))
     random.seed(0)
     random.shuffle(shuffled_indices)
-    gpu_config_indices: Dict[int, List[int]] = {gid: [] for gid in gpu_ids}
-    for i, ci in enumerate(shuffled_indices):
-        gid = gpu_ids[i % num_gpus]
-        gpu_config_indices[gid].append(ci)
+    for ci in shuffled_indices:
+        task_queue.put(ci)
+    # Poison pills: one per worker to signal termination
+    for _ in gpu_ids:
+        task_queue.put(None)
 
     # Launch workers
-    mp.set_start_method("spawn", force=True)
-    result_queue = mp.Queue()
     workers = []
     for gid in gpu_ids:
         p = mp.Process(
             target=_gpu_worker,
             args=(
                 gid,
-                gpu_config_indices[gid],
+                task_queue,
                 configs,
                 args.data_dir,
                 args.max_samples,
