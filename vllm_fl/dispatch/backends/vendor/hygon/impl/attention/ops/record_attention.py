@@ -1,5 +1,5 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
-# Recording utility for kernel_unified_attention_2d inputs/outputs.
+# Recording utility for kernel_unified_attention_2d/3d inputs/outputs.
 # Controlled by env vars; zero overhead when disabled.
 #
 # Env vars:
@@ -59,6 +59,56 @@ def _gather_used_blocks(
     return torch.cat(all_used).unique().sort().values
 
 
+def _should_record_sample(seqused_k: torch.Tensor) -> bool:
+    """Check counters and decide whether to record this call.
+
+    Returns True if this call should be recorded, False otherwise.
+    Manages _call_counter, _effective_call_counter, _sample_counter internally.
+    """
+    global _call_counter, _effective_call_counter, _sample_counter
+
+    if _sample_counter >= _MAX_SAMPLES:
+        return False
+
+    # Skip CUDA Graph warmup dummy data (all seqused_k == 1)
+    if seqused_k.max().item() <= 1:
+        return False
+
+    should_record = (_call_counter % _LAYER_COUNT == 0)
+    _call_counter += 1
+
+    if not should_record:
+        return False
+
+    # Skip first N effective calls (warmup/CUDA Graph capture phase)
+    _effective_call_counter += 1
+    if _effective_call_counter <= _SKIP_COUNT:
+        return False
+
+    return True
+
+
+def _save_sample(payload: dict, kernel_tag: str) -> None:
+    """Save a payload dict and manage sample counter."""
+    global _sample_counter
+
+    _sample_counter += 1
+    sample_idx = _sample_counter
+
+    save_dir = Path(_RECORD_DIR)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    filepath = save_dir / f"attn_sample_{sample_idx:04d}.pt"
+    torch.save(payload, filepath)
+    logger.info("Recorded %s attention sample %d → %s (lite=%s)",
+                kernel_tag, sample_idx, filepath, _LITE_MODE)
+
+    if _sample_counter >= _MAX_SAMPLES:
+        logger.info(
+            "Reached max attention samples (%s). Recording stopped.", _MAX_SAMPLES,
+        )
+
+
 def maybe_record(
     q, k, v, out, block_table, seqused_k, cu_seqlens_q,
     sinks, alibi_slopes, qq_bias, mm_prefix_range,
@@ -70,32 +120,9 @@ def maybe_record(
     USE_SINKS, USE_MM_PREFIX, MAX_MM_RANGES, USE_FP8, USE_SPARSE,
     num_seqs,
 ):
-    """Record one sample if it's this layer's turn and cap not reached."""
-    global _call_counter, _effective_call_counter, _sample_counter
-
-    if _sample_counter >= _MAX_SAMPLES:
+    """Record one 2D kernel sample if it's this layer's turn and cap not reached."""
+    if not _should_record_sample(seqused_k):
         return
-
-    # Skip CUDA Graph warmup dummy data (all seqused_k == 1)
-    if seqused_k.max().item() <= 1:
-        return
-
-    should_record = (_call_counter % _LAYER_COUNT == 0)
-    _call_counter += 1
-
-    if not should_record:
-        return
-
-    # Skip first N effective calls (warmup/CUDA Graph capture phase)
-    _effective_call_counter += 1
-    if _effective_call_counter <= _SKIP_COUNT:
-        return
-
-    _sample_counter += 1
-    sample_idx = _sample_counter
-
-    save_dir = Path(_RECORD_DIR)
-    save_dir.mkdir(parents=True, exist_ok=True)
 
     if _LITE_MODE:
         payload = _build_lite_payload(
@@ -120,14 +147,8 @@ def maybe_record(
             num_seqs,
         )
 
-    filepath = save_dir / f"attn_sample_{sample_idx:04d}.pt"
-    torch.save(payload, filepath)
-    logger.info("Recorded attention sample %d → %s (lite=%s)", sample_idx, filepath, _LITE_MODE)
-
-    if _sample_counter >= _MAX_SAMPLES:
-        logger.info(
-            "Reached max attention samples (%s). Recording stopped.", _MAX_SAMPLES,
-        )
+    payload["_kernel"] = "2d"
+    _save_sample(payload, "2d")
 
 
 def _build_lite_payload(
@@ -287,3 +308,46 @@ def _build_full_payload(
     )
 
     return payload
+
+
+def maybe_record_3d(
+    q, k, v, out, block_table, seqused_k, cu_seqlens_q,
+    sinks, alibi_slopes, qq_bias, mm_prefix_range,
+    k_descale, v_descale,
+    softmax_scale, softcap, output_scale, softmax_threshold_val,
+    num_query_heads, num_kv_heads, num_queries_per_kv, head_size, block_size,
+    BLOCK_M, BLOCK_Q, TILE_SIZE, use_sparse, sliding_window,
+    USE_ALIBI_SLOPES, USE_ALIBI_SQRT, USE_QQ_BIAS, USE_SOFTCAP,
+    USE_SINKS, USE_MM_PREFIX, MAX_MM_RANGES, USE_SPARSE,
+    num_seqs, NUM_SEGMENTS_PER_SEQ,
+):
+    """Record one 3D kernel sample if it's this layer's turn and cap not reached."""
+    if not _should_record_sample(seqused_k):
+        return
+
+    if _LITE_MODE:
+        payload = _build_lite_payload(
+            q, k, block_table, seqused_k, cu_seqlens_q,
+            softmax_scale, softcap, output_scale, softmax_threshold_val,
+            num_query_heads, num_kv_heads, num_queries_per_kv, head_size, block_size,
+            BLOCK_M, BLOCK_Q, TILE_SIZE, use_sparse, sliding_window,
+            USE_ALIBI_SLOPES, USE_ALIBI_SQRT, USE_QQ_BIAS, USE_SOFTCAP,
+            USE_SINKS, USE_MM_PREFIX, MAX_MM_RANGES, False, USE_SPARSE,
+            num_seqs,
+        )
+    else:
+        payload = _build_full_payload(
+            q, k, v, out, block_table, seqused_k, cu_seqlens_q,
+            sinks, alibi_slopes, qq_bias, mm_prefix_range,
+            k_descale, v_descale,
+            softmax_scale, softcap, output_scale, softmax_threshold_val,
+            num_query_heads, num_kv_heads, num_queries_per_kv, head_size, block_size,
+            BLOCK_M, BLOCK_Q, TILE_SIZE, use_sparse, sliding_window,
+            USE_ALIBI_SLOPES, USE_ALIBI_SQRT, USE_QQ_BIAS, USE_SOFTCAP,
+            USE_SINKS, USE_MM_PREFIX, MAX_MM_RANGES, False, USE_SPARSE,
+            num_seqs,
+        )
+
+    payload["_kernel"] = "3d"
+    payload["NUM_SEGMENTS_PER_SEQ"] = NUM_SEGMENTS_PER_SEQ
+    _save_sample(payload, "3d")
