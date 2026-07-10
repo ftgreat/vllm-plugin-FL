@@ -1084,4 +1084,5 @@ def unified_attention(
                 USE_SPARSE=use_sparse,
                 num_seqs=num_seqs,
                 NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+                seq_threshold_3D=seq_threshold_3D,
             )

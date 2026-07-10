@@ -351,7 +351,7 @@ def maybe_record_3d(
     BLOCK_M, BLOCK_Q, TILE_SIZE, use_sparse, sliding_window,
     USE_ALIBI_SLOPES, USE_ALIBI_SQRT, USE_QQ_BIAS, USE_SOFTCAP,
     USE_SINKS, USE_MM_PREFIX, MAX_MM_RANGES, USE_SPARSE,
-    num_seqs, NUM_SEGMENTS_PER_SEQ,
+    num_seqs, NUM_SEGMENTS_PER_SEQ, seq_threshold_3D,
 ):
     """Record one 3D kernel + reduce_segments sample."""
     if not _should_record_sample(seqused_k):
@@ -384,6 +384,7 @@ def maybe_record_3d(
 
     payload["_kernel"] = "3d"
     payload["NUM_SEGMENTS_PER_SEQ"] = NUM_SEGMENTS_PER_SEQ
+    payload["seq_threshold_3D"] = seq_threshold_3D
     # reduce_segments needs output strides (lite mode doesn't have 'out' tensor)
     payload["out_shape"] = tuple(out.shape)
     payload["out_dtype"] = str(out.dtype)

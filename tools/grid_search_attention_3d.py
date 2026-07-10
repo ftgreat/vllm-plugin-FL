@@ -159,6 +159,26 @@ def _cdiv(a, b):
     return (a + b - 1) // b
 
 
+# Default CUDA Graph capture sizes for decode (production FULL mode).
+# 3D kernel is only used when num_seqs <= seq_threshold_3D.
+_DEFAULT_CUDAGRAPH_CAPTURE_SIZES = [
+    1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64,
+    72, 80, 88, 96, 104, 112, 120, 128,
+]
+
+
+def _pad_to_capture_size(num_seqs: int, seq_threshold_3D: int) -> int:
+    """Pad num_seqs to the nearest CUDA Graph capture size (>= num_seqs).
+
+    In production FULL mode, the batch is padded to a capture-size bucket.
+    This simulates that padding so grid search matches real kernel launch grids.
+    """
+    for size in _DEFAULT_CUDAGRAPH_CAPTURE_SIZES:
+        if size >= num_seqs:
+            return min(size, seq_threshold_3D)
+    return num_seqs  # fallback: no padding if beyond all capture sizes
+
+
 def prepare_kernel_args_3d_lite(
     sample: Dict[str, Any], config: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -180,16 +200,34 @@ def prepare_kernel_args_3d_lite(
     seqused_k = sample["seqused_k"].cuda()
     cu_seqlens_q = sample["cu_seqlens_q"].cuda()
 
-    # Construct synthetic tensors
-    q_shape = tuple(sample["q_shape"])
+    # ── Simulate CUDA Graph FULL mode padding ──
+    # In production, decode batches are padded to capture-size buckets.
+    # Padded sequences have seqused_k=0, cu_seqlens_q flat, block_table null.
+    seq_threshold_3D = sample.get("seq_threshold_3D", 64)
+    padded_num_seqs = _pad_to_capture_size(num_seqs, seq_threshold_3D)
+    pad_count = padded_num_seqs - num_seqs
+
+    if pad_count > 0:
+        seqused_k = torch.cat([
+            seqused_k,
+            torch.zeros(pad_count, dtype=seqused_k.dtype, device="cuda"),
+        ])
+        last_val = cu_seqlens_q[-1]
+        cu_seqlens_q = torch.cat([
+            cu_seqlens_q,
+            last_val.expand(pad_count),
+        ])
+        num_seqs = padded_num_seqs
+
+    # Construct synthetic tensors (use padded num_seqs for q/out shape)
+    q_shape = (num_seqs, sample["q_shape"][1], sample["q_shape"][2])
     q = torch.randn(q_shape, dtype=dtype, device="cuda")
 
     # Use recorded out dtype/shape if available (may differ from q when USE_FP8)
     out_dtype_str = sample.get("out_dtype")
     if out_dtype_str:
         out_dt = getattr(torch, _DTYPE_MAP.get(out_dtype_str, out_dtype_str.replace("torch.", "")))
-        out_shape = tuple(sample.get("out_shape", q_shape))
-        out = torch.empty(out_shape, dtype=out_dt, device="cuda")
+        out = torch.empty(num_seqs, q_shape[1], q_shape[2], dtype=out_dt, device="cuda")
     else:
         out = torch.empty_like(q)
 
