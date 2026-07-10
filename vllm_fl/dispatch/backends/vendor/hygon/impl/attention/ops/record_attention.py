@@ -8,6 +8,7 @@
 #   VLLM_FL_RECORD_ATTN_MAX_SAMPLES - Max samples to record (default: inf)
 #   VLLM_FL_RECORD_ATTN_LITE      - 1=lightweight (shapes only), 0=full tensors (default: 1)
 #   VLLM_FL_RECORD_ATTN_SKIP      - Skip first N effective calls before recording (default: 0)
+#   VLLM_FL_RECORD_ATTN_RANK      - Only record on this TP rank (empty=all ranks, default: empty)
 
 import math
 import os
@@ -26,14 +27,40 @@ _MAX_SAMPLES_STR = os.environ.get("VLLM_FL_RECORD_ATTN_MAX_SAMPLES", "inf")
 _MAX_SAMPLES = float(_MAX_SAMPLES_STR) if _MAX_SAMPLES_STR.lower() == "inf" else int(_MAX_SAMPLES_STR)
 _LITE_MODE = os.environ.get("VLLM_FL_RECORD_ATTN_LITE", "1") == "1"
 _SKIP_COUNT = int(os.environ.get("VLLM_FL_RECORD_ATTN_SKIP", "0"))
+_RECORD_RANK_STR = os.environ.get("VLLM_FL_RECORD_ATTN_RANK", "").strip()
+_RECORD_RANK = int(_RECORD_RANK_STR) if _RECORD_RANK_STR else None
 
 RECORDING_ENABLED: bool = bool(_RECORD_DIR)
+
+# Lazy rank check: deferred to first recording call since torch.distributed
+# may not be initialized at import time.
+_rank_checked: bool = False
+
+
+def _check_rank() -> bool:
+    """Check if this rank should record. Disables RECORDING_ENABLED if not."""
+    global _rank_checked, RECORDING_ENABLED
+    _rank_checked = True
+    if _RECORD_RANK is None:
+        return True
+    try:
+        rank = torch.distributed.get_rank()
+    except Exception:
+        rank = 0
+    if rank != _RECORD_RANK:
+        RECORDING_ENABLED = False
+        logger.info("Attention recording disabled on rank %d (only rank %d records)",
+                     rank, _RECORD_RANK)
+        return False
+    logger.info("Attention recording active on rank %d", rank)
+    return True
 
 if RECORDING_ENABLED:
     logger.info(
         "Attention recording enabled: dir=%s, layer_count=%d, max_samples=%s, "
-        "lite=%s, skip=%d",
+        "lite=%s, skip=%d, rank=%s",
         _RECORD_DIR, _LAYER_COUNT, _MAX_SAMPLES_STR, _LITE_MODE, _SKIP_COUNT,
+        _RECORD_RANK_STR if _RECORD_RANK_STR else "all",
     )
 
 # ── Mutable state ──
@@ -65,7 +92,12 @@ def _should_record_sample(seqused_k: torch.Tensor) -> bool:
     Returns True if this call should be recorded, False otherwise.
     Manages _call_counter, _effective_call_counter, _sample_counter internally.
     """
-    global _call_counter, _effective_call_counter, _sample_counter
+    global _call_counter, _effective_call_counter, _sample_counter, _rank_checked
+
+    # Lazy rank check (torch.distributed may not be ready at import time)
+    if not _rank_checked:
+        if not _check_rank():
+            return False
 
     if _sample_counter >= _MAX_SAMPLES:
         return False
