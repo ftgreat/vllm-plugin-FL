@@ -97,6 +97,8 @@ _DTYPE_MAP = {
     "torch.bfloat16": "bfloat16",
     "torch.float16": "float16",
     "torch.float32": "float32",
+    "torch.float8_e4m3fnuz": "float8_e4m3fnuz",
+    "torch.float8_e4m3fn": "float8_e4m3fn",
 }
 
 
@@ -181,7 +183,15 @@ def prepare_kernel_args_3d_lite(
     # Construct synthetic tensors
     q_shape = tuple(sample["q_shape"])
     q = torch.randn(q_shape, dtype=dtype, device="cuda")
-    out = torch.empty_like(q)
+
+    # Use recorded out dtype/shape if available (may differ from q when USE_FP8)
+    out_dtype_str = sample.get("out_dtype")
+    if out_dtype_str:
+        out_dt = getattr(torch, _DTYPE_MAP.get(out_dtype_str, out_dtype_str.replace("torch.", "")))
+        out_shape = tuple(sample.get("out_shape", q_shape))
+        out = torch.empty(out_shape, dtype=out_dt, device="cuda")
+    else:
+        out = torch.empty_like(q)
 
     block_table, total_blocks = _build_sequential_block_table(seqused_k, block_size, q.device)
     k_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda")

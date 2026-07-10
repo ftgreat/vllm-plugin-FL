@@ -977,37 +977,6 @@ def unified_attention(
             num_warps=8,
             num_stages=2,
         )
-        if RECORDING_ENABLED and not torch.cuda.is_current_stream_capturing():
-            torch.cuda.synchronize()
-            from .record_attention import maybe_record
-            maybe_record(
-                q=q, k=k, v=v, out=out,
-                block_table=block_table, seqused_k=seqused_k,
-                cu_seqlens_q=cu_seqlens_q,
-                sinks=sinks, alibi_slopes=alibi_slopes,
-                qq_bias=qq_bias, mm_prefix_range=mm_prefix_range,
-                k_descale=k_descale, v_descale=v_descale,
-                softmax_scale=softmax_scale, softcap=softcap,
-                output_scale=output_scale,
-                softmax_threshold_val=softmax_threshold_val,
-                num_query_heads=num_query_heads, num_kv_heads=num_kv_heads,
-                num_queries_per_kv=num_queries_per_kv,
-                head_size=head_size, block_size=block_size,
-                BLOCK_M=BLOCK_M_2D, BLOCK_Q=BLOCK_Q_2D,
-                TILE_SIZE=TILE_SIZE_PREFILL,
-                use_sparse=use_sparse,
-                sliding_window=(1 + window_size[0]),
-                USE_ALIBI_SLOPES=use_alibi_slopes,
-                USE_ALIBI_SQRT=use_alibi_sqrt,
-                USE_QQ_BIAS=use_qq_bias,
-                USE_SOFTCAP=(softcap > 0),
-                USE_SINKS=(sinks is not None),
-                USE_MM_PREFIX=use_mm_prefix,
-                MAX_MM_RANGES=max_mm_ranges,
-                USE_FP8=output_scale is not None,
-                USE_SPARSE=use_sparse,
-                num_seqs=num_seqs,
-            )
     else:
         # 3D kernel for decode-only batches (performance optimized)
         kernel_unified_attention_3d[
