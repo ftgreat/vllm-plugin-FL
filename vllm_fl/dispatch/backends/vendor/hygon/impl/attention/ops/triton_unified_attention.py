@@ -798,6 +798,10 @@ def unified_attention(
     mm_prefix_range=None,
     use_alibi_sqrt=False,
     softmax_threshold=None,
+    # 3D kernel tuning params (optional, if None use defaults)
+    tile_size_3d=None,
+    num_warps_3d=None,
+    num_stages_3d=None,
     # V3 new params - accepted but handled via fallback for non-standard cases
     kv_quant_mode=None,
     k_scale_cache=None,
@@ -1004,7 +1008,7 @@ def unified_attention(
             query_stride_1=q.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            TILE_SIZE=TILE_SIZE_DECODE,
+            TILE_SIZE=tile_size_3d if tile_size_3d is not None else TILE_SIZE_DECODE,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             USE_ALIBI_SLOPES=use_alibi_slopes,
@@ -1031,9 +1035,10 @@ def unified_attention(
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             softmax_threshold=softmax_threshold_val,
             USE_SPARSE=use_sparse,
-            num_warps=2,
-            num_stages=1,
+            num_warps=num_warps_3d if num_warps_3d is not None else 2,
+            num_stages=num_stages_3d if num_stages_3d is not None else 1,
         )
+        _tile_3d = tile_size_3d if tile_size_3d is not None else TILE_SIZE_DECODE
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=softmax_segm_output,
@@ -1046,7 +1051,7 @@ def unified_attention(
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
-            TILE_SIZE=TILE_SIZE_DECODE,
+            TILE_SIZE=_tile_3d,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
@@ -1071,7 +1076,7 @@ def unified_attention(
                 num_queries_per_kv=num_queries_per_kv,
                 head_size=head_size, block_size=block_size,
                 BLOCK_M=BLOCK_M_3D, BLOCK_Q=BLOCK_Q_3D,
-                TILE_SIZE=TILE_SIZE_DECODE,
+                TILE_SIZE=_tile_3d,
                 use_sparse=use_sparse,
                 sliding_window=(1 + window_size[0]),
                 USE_ALIBI_SLOPES=use_alibi_slopes,
