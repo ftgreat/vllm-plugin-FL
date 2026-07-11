@@ -77,8 +77,8 @@ class AttentionOptimizedMetadataBuilder(TritonAttentionMetadataBuilder):
     """Override builder to allocate dual segment buffers and select config
     based on num_seqs at build time."""
 
-    def __init__(self, kv_cache_spec, vllm_config, device):
-        super().__init__(kv_cache_spec, vllm_config, device)
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
         from triton import next_power_of_2
         headdim_padded = next_power_of_2(self.headdim)
