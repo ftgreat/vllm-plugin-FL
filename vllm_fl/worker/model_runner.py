@@ -440,6 +440,8 @@ class ExecuteModelState(NamedTuple):
 class ModelRunnerFL(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    _use_rowwise_mrope_copy: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -2058,16 +2060,50 @@ class ModelRunnerFL(
 
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
-            )
+            if self._use_rowwise_mrope_copy:
+                # Row-wise copy: each row of [3, max_tokens+1] is contiguous,
+                # keeping the source pinned and the H2D transfer truly async.
+                # Avoids CPU bubble from non-contiguous slice materializing
+                # into pageable memory (synchronous hipMemcpyAsync on ROCm).
+                for i in range(self.mrope_positions.gpu.shape[0]):
+                    self.mrope_positions.gpu[
+                        i, :total_num_scheduled_tokens
+                    ].copy_(
+                        self.mrope_positions.cpu[
+                            i, :total_num_scheduled_tokens
+                        ],
+                        non_blocking=True,
+                    )
+            else:
+                self.mrope_positions.gpu[
+                    :, :total_num_scheduled_tokens
+                ].copy_(
+                    self.mrope_positions.cpu[
+                        :, :total_num_scheduled_tokens
+                    ],
+                    non_blocking=True,
+                )
         elif self.uses_xdrope_dim > 0:
             # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
-            )
+            if self._use_rowwise_mrope_copy:
+                for i in range(self.xdrope_positions.gpu.shape[0]):
+                    self.xdrope_positions.gpu[
+                        i, :total_num_scheduled_tokens
+                    ].copy_(
+                        self.xdrope_positions.cpu[
+                            i, :total_num_scheduled_tokens
+                        ],
+                        non_blocking=True,
+                    )
+            else:
+                self.xdrope_positions.gpu[
+                    :, :total_num_scheduled_tokens
+                ].copy_(
+                    self.xdrope_positions.cpu[
+                        :, :total_num_scheduled_tokens
+                    ],
+                    non_blocking=True,
+                )
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
                 torch.int64

@@ -19,6 +19,7 @@ def apply_hygon_patches():
     patch_causal_conv1d_update()
     patch_chunk_delta_h()
     patch_prefill_l2norm_precision()
+    patch_rowwise_mrope_copy()
 
 
 def patch_ssm_state_dtype():
@@ -136,3 +137,21 @@ def patch_prefill_l2norm_precision():
         )
     except Exception as e:
         logger.warning("Failed to patch prefill L2norm precision: %s", e)
+
+
+def patch_rowwise_mrope_copy():
+    """Enable row-wise H2D copy for mrope/xdrope positions.
+
+    The mrope_positions buffer is [3, max_tokens+1] — slicing [:, :N] is
+    non-contiguous. PyTorch's copy_() materializes the non-contiguous source
+    into a pageable temporary, making hipMemcpyAsync synchronous on the host.
+    Row-wise copy keeps each slice contiguous (pinned), so the transfer is
+    genuinely async and eliminates the CPU bubble (~4.6% decode throughput).
+    """
+    from vllm_fl.worker.model_runner import ModelRunnerFL
+
+    ModelRunnerFL._use_rowwise_mrope_copy = True
+    logger.info(
+        "Patched mrope/xdrope positions: using row-wise H2D copy "
+        "to avoid CPU bubble from non-contiguous pageable memcpy"
+    )
