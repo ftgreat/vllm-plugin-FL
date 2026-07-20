@@ -31,14 +31,14 @@ else:
     logger.info("Sparse attention disabled")
 
 
-def _gather_paged_kv(key_cache, value_cache, block_table, seqused_k,
-                     max_seqlen_k):
-    """Gather paged KV into padded [num_seqs * max_seqlen_k, nkv, hd] tensors.
+def _gather_paged_kv_and_attn(query, key_cache, value_cache, block_table,
+                               seqused_k, max_seqlen_k, cu_seqlens_q,
+                               max_seqlen_q, output, softmax_scale, causal,
+                               alibi_slopes, window_size, softcap):
+    """Gather paged KV into padded layout and run flash_attn with seqused_k.
 
-    Pure GPU tensor ops — no .item() calls, safe under CUDA Graph capture.
-    Each sequence occupies a max_seqlen_k-sized slot; positions beyond the
-    actual length are zeroed so they don't affect causal attention.
-    Returns (k_padded, v_padded, cu_seqlens_k, max_seqlen_k).
+    Uses padded cu_seqlens_k (stride=max_seqlen_k) + real seqused_k so the
+    C kernel only attends to valid tokens. Pure GPU ops, CUDA-graph safe.
     """
     block_size = key_cache.shape[1]
     num_kv_heads = key_cache.shape[2]
@@ -66,16 +66,38 @@ def _gather_paged_kv(key_cache, value_cache, block_table, seqused_k,
     k_flat = key_cache.reshape(-1, num_kv_heads, head_size)[flat_1d]
     v_flat = value_cache.reshape(-1, num_kv_heads, head_size)[flat_1d]
 
-    mask_1d = seq_mask.reshape(-1).unsqueeze(1).unsqueeze(2)
-    k_flat = k_flat * mask_1d
-    v_flat = v_flat * mask_1d
-
     cu_seqlens_k = torch.arange(
         0, (num_seqs + 1) * max_seqlen_k, max_seqlen_k,
         dtype=torch.int32, device=key_cache.device,
     )
 
-    return k_flat, v_flat, cu_seqlens_k, max_seqlen_k
+    from flash_attn.flash_attn_interface import (
+        _wrapped_flash_attn_varlen_forward,
+    )
+
+    out, _, _, _ = _wrapped_flash_attn_varlen_forward(
+        query,
+        k_flat,
+        v_flat,
+        output,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,       # actual per-seq lengths within padded slots
+        None,             # leftpad_k
+        None,             # block_table (KV already gathered)
+        alibi_slopes,
+        max_seqlen_q,
+        max_seqlen_k,
+        0.0,              # dropout
+        softmax_scale,
+        False,            # zero_tensors
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        False,            # return_softmax
+    )
+    return out
 
 
 class AttentionOptimizedMetadataBuilder(TritonAttentionMetadataBuilder):
@@ -83,7 +105,6 @@ class AttentionOptimizedMetadataBuilder(TritonAttentionMetadataBuilder):
     def build_for_cudagraph_capture(self, common_attn_metadata):
         attn_metadata = self.build(0, common_attn_metadata)
         attn_metadata.seq_lens.fill_(1)
-        # Keep max_seq_len consistent with seq_lens to avoid OOM in KV gather.
         attn_metadata.max_seq_len = 1
         return attn_metadata
 
@@ -167,26 +188,14 @@ class AttentionOptimizedImpl(TritonAttentionImpl):
 
         # hg_flash_attn_varlen_func paged kernels only support block_size 64 or 128.
         # Hybrid models (e.g. Qwen3.5 with mamba) force block_size=784 to match
-        # mamba page size. Fall back to gathering KV into contiguous tensors.
+        # mamba page size. Gather KV and call varlen_fwd directly with seqused_k.
         if block_size not in (64, 128):
-            k_gathered, v_gathered, cu_seqlens_k, max_seqlen_k_gathered = \
-                _gather_paged_kv(key_cache, value_cache, block_table,
-                                 seqused_k, max_seqlen_k)
-
-            hg_flash_attn_varlen_func(
-                q=query[:num_actual_tokens],
-                k=k_gathered,
-                v=v_gathered,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k_gathered,
-                softmax_scale=self.scale,
-                causal=True,
-                alibi_slopes=self.alibi_slopes,
-                window_size=self.sliding_window,
-                softcap=self.logits_soft_cap,
-                out=output[:num_actual_tokens],
+            _gather_paged_kv_and_attn(
+                query[:num_actual_tokens], key_cache, value_cache,
+                block_table, seqused_k, max_seqlen_k,
+                cu_seqlens_q, max_seqlen_q, output[:num_actual_tokens],
+                self.scale, True, self.alibi_slopes,
+                self.sliding_window, self.logits_soft_cap,
             )
             return output
 
