@@ -31,37 +31,57 @@ else:
     logger.info("Sparse attention disabled")
 
 
-def _gather_paged_kv(key_cache, value_cache, block_table, seqused_k):
-    """Gather paged KV cache into contiguous [total_k, num_kv_heads, head_size] tensors.
+def _gather_paged_kv(key_cache, value_cache, block_table, seqused_k,
+                     max_seqlen_k):
+    """Gather paged KV into padded [num_seqs * max_seqlen_k, nkv, hd] tensors.
 
-    Also returns cu_seqlens_k and max_seqlen_k for the gathered KV.
+    Pure GPU tensor ops — no .item() calls, safe under CUDA Graph capture.
+    Each sequence occupies a max_seqlen_k-sized slot; positions beyond the
+    actual length are zeroed so they don't affect causal attention.
+    Returns (k_padded, v_padded, cu_seqlens_k, max_seqlen_k).
     """
     block_size = key_cache.shape[1]
     num_kv_heads = key_cache.shape[2]
     head_size = key_cache.shape[3]
     num_seqs = seqused_k.shape[0]
+    max_blocks_per_seq = block_table.shape[1]
 
-    k_parts = []
-    v_parts = []
-    cu_seqlens_k_list = [0]
-    total_k = 0
-    for i in range(num_seqs):
-        seq_len = int(seqused_k[i].item())
-        if seq_len == 0:
-            cu_seqlens_k_list.append(total_k)
-            continue
-        n_blk = (seq_len + block_size - 1) // block_size
-        blk_ids = block_table[i, :n_blk]
-        k_parts.append(key_cache[blk_ids].reshape(-1, num_kv_heads, head_size)[:seq_len])
-        v_parts.append(value_cache[blk_ids].reshape(-1, num_kv_heads, head_size)[:seq_len])
-        total_k += seq_len
-        cu_seqlens_k_list.append(total_k)
+    # token_offsets: [max_seqlen_k] = [0, 1, 2, ..., max_seqlen_k-1]
+    token_offsets = torch.arange(max_seqlen_k, device=key_cache.device)
+    block_ids_per_token = token_offsets // block_size
+    offset_in_block = token_offsets % block_size
 
-    k_gathered = torch.cat(k_parts, dim=0) if k_parts else key_cache.new_empty(0, num_kv_heads, head_size)
-    v_gathered = torch.cat(v_parts, dim=0) if v_parts else value_cache.new_empty(0, num_kv_heads, head_size)
-    cu_seqlens_k = torch.tensor(cu_seqlens_k_list, dtype=torch.int32, device=key_cache.device)
-    max_seqlen_k = int(seqused_k.max().item()) if num_seqs > 0 else 0
-    return k_gathered, v_gathered, cu_seqlens_k, max_seqlen_k
+    # Clamp block indices to valid range for gather.
+    block_ids_clamped = block_ids_per_token.unsqueeze(0).expand(num_seqs, -1) \
+        .clamp(max=max_blocks_per_seq - 1)
+
+    # physical_blocks: (num_seqs, max_seqlen_k)
+    physical_blocks = block_table.gather(1, block_ids_clamped)
+    flat_indices = physical_blocks * block_size + offset_in_block.unsqueeze(0)
+
+    # Mask: True for valid positions (j < seqused_k[i]).
+    seq_mask = token_offsets.unsqueeze(0) < seqused_k.unsqueeze(1)
+    flat_indices = flat_indices.where(seq_mask, torch.zeros_like(flat_indices))
+
+    flat_1d = flat_indices.reshape(-1)
+    kv_total = key_cache.shape[0] * block_size
+    flat_1d = flat_1d.clamp(max=kv_total - 1)
+
+    k_flat = key_cache.reshape(-1, num_kv_heads, head_size)[flat_1d]
+    v_flat = value_cache.reshape(-1, num_kv_heads, head_size)[flat_1d]
+
+    # Zero out padded positions.
+    mask_1d = seq_mask.reshape(-1).unsqueeze(1).unsqueeze(2)
+    k_flat = k_flat * mask_1d
+    v_flat = v_flat * mask_1d
+
+    # cu_seqlens_k with max_seqlen_k stride (padded layout).
+    cu_seqlens_k = torch.arange(
+        0, (num_seqs + 1) * max_seqlen_k, max_seqlen_k,
+        dtype=torch.int32, device=key_cache.device,
+    )
+
+    return k_flat, v_flat, cu_seqlens_k, max_seqlen_k
 
 
 class AttentionOptimizedBackend(TritonAttentionBackend):
@@ -139,6 +159,7 @@ class AttentionOptimizedImpl(TritonAttentionImpl):
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
         max_seqlen_q = attn_metadata.max_query_len
+        max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
         block_size = key_cache.shape[1]
 
@@ -148,8 +169,9 @@ class AttentionOptimizedImpl(TritonAttentionImpl):
         # Hybrid models (e.g. Qwen3.5 with mamba) force block_size=784 to match
         # mamba page size. Fall back to gathering KV into contiguous tensors.
         if block_size not in (64, 128):
-            k_gathered, v_gathered, cu_seqlens_k, max_seqlen_k = \
-                _gather_paged_kv(key_cache, value_cache, block_table, seqused_k)
+            k_gathered, v_gathered, cu_seqlens_k, max_seqlen_k_gathered = \
+                _gather_paged_kv(key_cache, value_cache, block_table,
+                                 seqused_k, max_seqlen_k)
 
             hg_flash_attn_varlen_func(
                 q=query[:num_actual_tokens],
@@ -158,7 +180,7 @@ class AttentionOptimizedImpl(TritonAttentionImpl):
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
+                max_seqlen_k=max_seqlen_k_gathered,
                 softmax_scale=self.scale,
                 causal=True,
                 alibi_slopes=self.alibi_slopes,
@@ -182,7 +204,7 @@ class AttentionOptimizedImpl(TritonAttentionImpl):
             v=value_cache,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=attn_metadata.max_seq_len,
+            max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale,
             causal=True,
             alibi_slopes=self.alibi_slopes,
