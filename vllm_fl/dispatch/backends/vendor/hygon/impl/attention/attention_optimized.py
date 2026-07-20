@@ -1,5 +1,5 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
-# Optimized attention backend using flash_attn kernels.
+# Optimized attention backend: flash_attn prefill + Triton 3D split-KV decode.
 
 import os
 
@@ -17,7 +17,10 @@ from vllm.utils.torch_utils import is_quantized_kv_cache
 
 logger = init_logger(__name__)
 
-# Sparse attention threshold from environment variable.
+_3D_CONFIG_LOW = (32, 64, 4, 1)   # num_seqs <= 16
+_3D_CONFIG_MID = (16, 64, 4, 1)   # num_seqs 17~56
+_3D_CONFIG_HIGH = (8, 16, 4, 1)   # num_seqs 57~64
+
 _SPARSE_THRESHOLD_ENV = os.environ.get('VLLM_SPARSE_THRESHOLD', '0')
 _SPARSE_THRESHOLD = (
     float(_SPARSE_THRESHOLD_ENV)
@@ -31,86 +34,7 @@ else:
     logger.info("Sparse attention disabled")
 
 
-def _gather_paged_kv_and_attn(query, key_cache, value_cache, block_table,
-                               seqused_k, max_seqlen_k, cu_seqlens_q,
-                               max_seqlen_q, output, softmax_scale, causal,
-                               alibi_slopes, window_size, softcap):
-    """Gather paged KV into padded layout and run flash_attn with seqused_k.
-
-    Uses padded cu_seqlens_k (stride=max_seqlen_k) + real seqused_k so the
-    C kernel only attends to valid tokens. Pure GPU ops, CUDA-graph safe.
-    """
-    block_size = key_cache.shape[1]
-    num_kv_heads = key_cache.shape[2]
-    head_size = key_cache.shape[3]
-    num_seqs = seqused_k.shape[0]
-    max_blocks_per_seq = block_table.shape[1]
-
-    token_offsets = torch.arange(max_seqlen_k, device=key_cache.device)
-    block_ids_per_token = token_offsets // block_size
-    offset_in_block = token_offsets % block_size
-
-    block_ids_clamped = block_ids_per_token.unsqueeze(0).expand(num_seqs, -1) \
-        .clamp(max=max_blocks_per_seq - 1)
-
-    physical_blocks = block_table.gather(1, block_ids_clamped)
-    flat_indices = physical_blocks * block_size + offset_in_block.unsqueeze(0)
-
-    seq_mask = token_offsets.unsqueeze(0) < seqused_k.unsqueeze(1)
-    flat_indices = flat_indices.where(seq_mask, torch.zeros_like(flat_indices))
-
-    flat_1d = flat_indices.reshape(-1)
-    kv_total = key_cache.shape[0] * block_size
-    flat_1d = flat_1d.clamp(max=kv_total - 1)
-
-    k_flat = key_cache.reshape(-1, num_kv_heads, head_size)[flat_1d]
-    v_flat = value_cache.reshape(-1, num_kv_heads, head_size)[flat_1d]
-
-    cu_seqlens_k = torch.arange(
-        0, (num_seqs + 1) * max_seqlen_k, max_seqlen_k,
-        dtype=torch.int32, device=key_cache.device,
-    )
-
-    from flash_attn.flash_attn_interface import (
-        _wrapped_flash_attn_varlen_forward,
-    )
-
-    out, _, _, _ = _wrapped_flash_attn_varlen_forward(
-        query,
-        k_flat,
-        v_flat,
-        output,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_k,       # actual per-seq lengths within padded slots
-        None,             # leftpad_k
-        None,             # block_table (KV already gathered)
-        alibi_slopes,
-        max_seqlen_q,
-        max_seqlen_k,
-        0.0,              # dropout
-        softmax_scale,
-        False,            # zero_tensors
-        causal,
-        window_size[0],
-        window_size[1],
-        softcap,
-        False,            # return_softmax
-    )
-    return out
-
-
-class AttentionOptimizedMetadataBuilder(TritonAttentionMetadataBuilder):
-
-    def build_for_cudagraph_capture(self, common_attn_metadata):
-        attn_metadata = self.build(0, common_attn_metadata)
-        attn_metadata.seq_lens.fill_(1)
-        attn_metadata.max_seq_len = 1
-        return attn_metadata
-
-
 class AttentionOptimizedBackend(TritonAttentionBackend):
-    """Optimized attention backend using flash_attn kernels."""
 
     @staticmethod
     def get_name() -> str:
@@ -125,8 +49,107 @@ class AttentionOptimizedBackend(TritonAttentionBackend):
         return AttentionOptimizedMetadataBuilder
 
 
+def _get_3d_config(num_seqs):
+    if num_seqs <= 16:
+        return _3D_CONFIG_LOW
+    elif num_seqs >= 57:
+        return _3D_CONFIG_HIGH
+    else:
+        return _3D_CONFIG_MID
+
+
+def _gather_kv(key_cache, value_cache, block_table, seqused_k):
+    """Gather paged KV into contiguous [total_k, nkv, hd] tensors + cu_seqlens_k.
+
+    Only called during prefill (never under CUDA Graph capture), so .item() is safe.
+    """
+    block_size = key_cache.shape[1]
+    num_kv_heads = key_cache.shape[2]
+    head_size = key_cache.shape[3]
+    num_seqs = seqused_k.shape[0]
+
+    k_parts = []
+    v_parts = []
+    cu_seqlens_k_list = [0]
+    total_k = 0
+    for i in range(num_seqs):
+        seq_len = int(seqused_k[i].item())
+        if seq_len == 0:
+            cu_seqlens_k_list.append(total_k)
+            continue
+        n_blk = (seq_len + block_size - 1) // block_size
+        blk_ids = block_table[i, :n_blk]
+        k_parts.append(key_cache[blk_ids].reshape(-1, num_kv_heads, head_size)[:seq_len])
+        v_parts.append(value_cache[blk_ids].reshape(-1, num_kv_heads, head_size)[:seq_len])
+        total_k += seq_len
+        cu_seqlens_k_list.append(total_k)
+
+    k_gathered = torch.cat(k_parts, dim=0) if k_parts else key_cache.new_empty(0, num_kv_heads, head_size)
+    v_gathered = torch.cat(v_parts, dim=0) if v_parts else value_cache.new_empty(0, num_kv_heads, head_size)
+    cu_seqlens_k = torch.tensor(cu_seqlens_k_list, dtype=torch.int32, device=key_cache.device)
+    max_seqlen_k = int(seqused_k.max().item()) if num_seqs > 0 else 0
+    return k_gathered, v_gathered, cu_seqlens_k, max_seqlen_k
+
+
+class AttentionOptimizedMetadataBuilder(TritonAttentionMetadataBuilder):
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
+        from triton import next_power_of_2
+        headdim_padded = next_power_of_2(self.headdim)
+
+        self.softmax_segm_output_32 = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, 32, headdim_padded),
+            dtype=torch.float32, device=device,
+        )
+        self.softmax_segm_max_32 = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, 32),
+            dtype=torch.float32, device=device,
+        )
+        self.softmax_segm_expsum_32 = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, 32),
+            dtype=torch.float32, device=device,
+        )
+        self.softmax_segm_output_8 = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, 8, headdim_padded),
+            dtype=torch.float32, device=device,
+        )
+        self.softmax_segm_max_8 = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, 8),
+            dtype=torch.float32, device=device,
+        )
+        self.softmax_segm_expsum_8 = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, 8),
+            dtype=torch.float32, device=device,
+        )
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        attn_metadata = super().build(
+            common_prefix_len, common_attn_metadata, fast_build,
+        )
+        num_seqs = common_attn_metadata.num_reqs
+        seg, _, _, _ = _get_3d_config(num_seqs)
+        if seg == 32:
+            attn_metadata.num_par_softmax_segments = 32
+            attn_metadata.softmax_segm_output = self.softmax_segm_output_32
+            attn_metadata.softmax_segm_max = self.softmax_segm_max_32
+            attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum_32
+        elif seg == 8:
+            attn_metadata.num_par_softmax_segments = 8
+            attn_metadata.softmax_segm_output = self.softmax_segm_output_8
+            attn_metadata.softmax_segm_max = self.softmax_segm_max_8
+            attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum_8
+        return attn_metadata
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        attn_metadata = self.build(0, common_attn_metadata)
+        attn_metadata.seq_lens.fill_(1)
+        return attn_metadata
+
+
 class AttentionOptimizedImpl(TritonAttentionImpl):
-    """Impl that uses hg_flash_attn_varlen_func for both prefill and decode."""
+    """flash_attn prefill + Triton 3D split-KV decode."""
 
     def forward(
         self,
@@ -176,54 +199,82 @@ class AttentionOptimizedImpl(TritonAttentionImpl):
             assert layer._q_scale_float == 1.0, (
                 "A non 1.0 q_scale is not currently supported."
             )
+        descale_shape = (
+            attn_metadata.query_start_loc.shape[0] - 1,
+            key_cache.shape[2],
+        )
+        k_descale = layer._k_scale.expand(descale_shape)
+        v_descale = layer._v_scale.expand(descale_shape)
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
-        block_size = key_cache.shape[1]
 
-        from flash_attn import hg_flash_attn_varlen_func
+        # --- Prefill: flash_attn (gather KV, non-paged varlen) ---
+        if max_seqlen_q > 1:
+            from flash_attn import flash_attn_varlen_func
 
-        # hg_flash_attn_varlen_func paged kernels only support block_size 64 or 128.
-        # Hybrid models (e.g. Qwen3.5 with mamba) force block_size=784 to match
-        # mamba page size. Gather KV and call varlen_fwd directly with seqused_k.
-        if block_size not in (64, 128):
-            _gather_paged_kv_and_attn(
-                query[:num_actual_tokens], key_cache, value_cache,
-                block_table, seqused_k, max_seqlen_k,
-                cu_seqlens_q, max_seqlen_q, output[:num_actual_tokens],
-                self.scale, True, self.alibi_slopes,
-                self.sliding_window, self.logits_soft_cap,
+            k_g, v_g, cu_seqlens_k, max_k = _gather_kv(
+                key_cache, value_cache, block_table, seqused_k)
+
+            o = flash_attn_varlen_func(
+                query[:num_actual_tokens],
+                k_g,
+                v_g,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_k,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=self.sliding_window,
+                alibi_slopes=self.alibi_slopes,
+                softcap=self.logits_soft_cap,
             )
+            output[:num_actual_tokens].copy_(o.reshape(output[:num_actual_tokens].shape))
             return output
 
-        # block_size 64 or 128: use native paged attention path
-        descale_shape = (
-            cu_seqlens_q.shape[0] - 1,
-            key_cache.shape[2],
+        # --- Decode: Triton 3D split-KV ---
+        from .ops.triton_unified_attention import (
+            unified_attention as optimized_unified_attention,
         )
-        k_descale = layer._k_scale.expand(descale_shape)
-        v_descale = layer._v_scale.expand(descale_shape)
 
-        hg_flash_attn_varlen_func(
+        num_seqs = cu_seqlens_q.shape[0] - 1
+        seg, tile_3d, warps_3d, stages_3d = _get_3d_config(num_seqs)
+
+        optimized_unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
             v=value_cache,
+            out=output[:num_actual_tokens],
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale,
             causal=True,
             alibi_slopes=self.alibi_slopes,
+            use_alibi_sqrt=self.use_alibi_sqrt,
             window_size=self.sliding_window,
             block_table=block_table,
             softcap=self.logits_soft_cap,
-            seqused_k=seqused_k,
-            out=output[:num_actual_tokens],
+            q_descale=None,
             k_descale=k_descale,
             v_descale=v_descale,
-            s_aux=self.sinks,
+            seq_threshold_3D=attn_metadata.seq_threshold_3D,
+            num_par_softmax_segments=attn_metadata.num_par_softmax_segments,
+            softmax_segm_output=attn_metadata.softmax_segm_output,
+            softmax_segm_max=attn_metadata.softmax_segm_max,
+            softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
+            sinks=self.sinks,
+            output_scale=output_scale,
+            mm_prefix_range=attn_metadata.mm_prefix_range_tensor,
+            softmax_threshold=_SPARSE_THRESHOLD,
+            tile_size_3d=tile_3d,
+            num_warps_3d=warps_3d,
+            num_stages_3d=stages_3d,
         )
+
         return output
