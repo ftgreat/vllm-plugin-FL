@@ -46,20 +46,16 @@ def _gather_paged_kv(key_cache, value_cache, block_table, seqused_k,
     num_seqs = seqused_k.shape[0]
     max_blocks_per_seq = block_table.shape[1]
 
-    # token_offsets: [max_seqlen_k] = [0, 1, 2, ..., max_seqlen_k-1]
     token_offsets = torch.arange(max_seqlen_k, device=key_cache.device)
     block_ids_per_token = token_offsets // block_size
     offset_in_block = token_offsets % block_size
 
-    # Clamp block indices to valid range for gather.
     block_ids_clamped = block_ids_per_token.unsqueeze(0).expand(num_seqs, -1) \
         .clamp(max=max_blocks_per_seq - 1)
 
-    # physical_blocks: (num_seqs, max_seqlen_k)
     physical_blocks = block_table.gather(1, block_ids_clamped)
     flat_indices = physical_blocks * block_size + offset_in_block.unsqueeze(0)
 
-    # Mask: True for valid positions (j < seqused_k[i]).
     seq_mask = token_offsets.unsqueeze(0) < seqused_k.unsqueeze(1)
     flat_indices = flat_indices.where(seq_mask, torch.zeros_like(flat_indices))
 
@@ -70,12 +66,10 @@ def _gather_paged_kv(key_cache, value_cache, block_table, seqused_k,
     k_flat = key_cache.reshape(-1, num_kv_heads, head_size)[flat_1d]
     v_flat = value_cache.reshape(-1, num_kv_heads, head_size)[flat_1d]
 
-    # Zero out padded positions.
     mask_1d = seq_mask.reshape(-1).unsqueeze(1).unsqueeze(2)
     k_flat = k_flat * mask_1d
     v_flat = v_flat * mask_1d
 
-    # cu_seqlens_k with max_seqlen_k stride (padded layout).
     cu_seqlens_k = torch.arange(
         0, (num_seqs + 1) * max_seqlen_k, max_seqlen_k,
         dtype=torch.int32, device=key_cache.device,
@@ -84,12 +78,18 @@ def _gather_paged_kv(key_cache, value_cache, block_table, seqused_k,
     return k_flat, v_flat, cu_seqlens_k, max_seqlen_k
 
 
-class AttentionOptimizedBackend(TritonAttentionBackend):
-    """Optimized attention backend using flash_attn kernels.
+class AttentionOptimizedMetadataBuilder(TritonAttentionMetadataBuilder):
 
-    Inherits all metadata/builder/cache logic from TritonAttentionBackend,
-    only overrides the impl class to use hg_flash_attn_varlen_func.
-    """
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        attn_metadata = self.build(0, common_attn_metadata)
+        attn_metadata.seq_lens.fill_(1)
+        # Keep max_seq_len consistent with seq_lens to avoid OOM in KV gather.
+        attn_metadata.max_seq_len = 1
+        return attn_metadata
+
+
+class AttentionOptimizedBackend(TritonAttentionBackend):
+    """Optimized attention backend using flash_attn kernels."""
 
     @staticmethod
     def get_name() -> str:
@@ -100,8 +100,8 @@ class AttentionOptimizedBackend(TritonAttentionBackend):
         return AttentionOptimizedImpl
 
     @staticmethod
-    def get_builder_cls() -> type["TritonAttentionMetadataBuilder"]:
-        return TritonAttentionMetadataBuilder
+    def get_builder_cls() -> type["AttentionOptimizedMetadataBuilder"]:
+        return AttentionOptimizedMetadataBuilder
 
 
 class AttentionOptimizedImpl(TritonAttentionImpl):
