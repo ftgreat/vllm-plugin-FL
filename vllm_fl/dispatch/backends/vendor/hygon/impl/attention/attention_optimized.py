@@ -31,7 +31,7 @@ _SPARSE_THRESHOLD = (
 # Prefill sequences with max_seq_len > this threshold use flash_attn (gather KV).
 # Shorter sequences use the Triton paged kernel directly (no gather overhead).
 _FLASH_PREFILL_THRESHOLD = int(
-    os.environ.get('VLLM_FLASH_PREFILL_THRESHOLD', '4096')
+    os.environ.get('VLLM_FLASH_PREFILL_THRESHOLD', '32768')
 )
 
 if _SPARSE_THRESHOLD is not None:
@@ -76,14 +76,16 @@ def _gather_kv(key_cache, value_cache, block_table, seqused_k, max_seqlen_k):
     block_size = key_cache.shape[1]
     num_kv_heads = key_cache.shape[2]
     head_size = key_cache.shape[3]
-    num_seqs = seqused_k.shape[0]
+
+    # Single GPU→CPU transfer for all seq lengths (1 sync instead of N .item() calls).
+    seq_len_list = seqused_k.tolist()
 
     k_parts = []
     v_parts = []
     cu_seqlens_k_list = [0]
     total_k = 0
-    for i in range(num_seqs):
-        seq_len = int(seqused_k[i].item())
+    for i, seq_len in enumerate(seq_len_list):
+        seq_len = int(seq_len)
         if seq_len == 0:
             cu_seqlens_k_list.append(total_k)
             continue
