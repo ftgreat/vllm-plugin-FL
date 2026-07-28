@@ -43,6 +43,15 @@ dist_backend_dict = {
 }
 
 
+def hygon_custom_ar_enabled() -> bool:
+    """Kill-switch for the Hygon custom allreduce path.
+
+    Set ``VLLM_FL_HYGON_CUSTOM_AR=0`` to fall back to the previous behaviour
+    (custom allreduce disabled, all-reduce served by NCCL/RCCL).
+    """
+    return os.getenv("VLLM_FL_HYGON_CUSTOM_AR", "1") == "1"
+
+
 class PlatformFL(Platform):
     _enum = PlatformEnum.OOT
     device_info = DeviceInfo()
@@ -300,6 +309,9 @@ class PlatformFL(Platform):
         if cls.dist_backend == "flagcx":
             logger.info("Using CommunicatorFL for communication.")
             return "vllm_fl.distributed.communicator.CommunicatorFL"  # noqa
+        elif cls.vendor_name == "hygon":
+            logger.info("Using CudaCommunicatorFL for communication.")
+            return "vllm_fl.distributed.device_communicators.cuda_communicator_fl.CudaCommunicatorFL"  # noqa
         else:
             logger.info("Using CudaCommunicator for communication.")
             return "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
@@ -349,10 +361,14 @@ class PlatformFL(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        if cls.vendor_name == "hygon":
-            return False
         if cls.dist_backend == "flagcx":
             return False
+        if cls.vendor_name == "hygon":
+            # Hygon DCU is a HIP/ROCm device and the `_C_custom_ar` extension
+            # works on it. The custom allreduce path itself only needs
+            # `is_cuda_alike()` for a single sanity assert, which
+            # CudaCommunicatorFL satisfies in a tightly scoped window.
+            return hygon_custom_ar_enabled()
         return True
 
     @classmethod
