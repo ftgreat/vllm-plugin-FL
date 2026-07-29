@@ -432,6 +432,25 @@ class PlatformFL(Platform):
     def use_custom_op_collectives(cls) -> bool:
         if cls.vendor_name == "nvidia":
             return True
+        if cls.vendor_name == "hygon":
+            # Custom allreduce can only be reached through the opaque
+            # `torch.ops.vllm.all_reduce` custom op. With this False,
+            # `GroupCoordinator.all_reduce` calls `_all_reduce_out_place`
+            # directly (parallel_state.py:513-516), Dynamo traces straight
+            # through it, and the collective is inlined into the compiled graph
+            # -- bypassing the device communicator entirely. The custom op is
+            # registered with a fake_impl (parallel_state.py:262), so it stays an
+            # opaque graph node whose body runs in Python during capture, which
+            # is exactly when custom allreduce must execute to register its
+            # graph buffers. Measured symptom of the False path: an entry probe
+            # on CudaCommunicatorFL.all_reduce counted 1 call (the eager vision
+            # tower) across a whole request that decoded ~1k tokens, and
+            # "Registering 0 cuda graph addresses".
+            #
+            # Gated on the kill-switch so mode 0 keeps the exact graph structure
+            # of the existing baseline -- switching collectives to a custom op
+            # changes the compiled graph and could affect fusion.
+            return hygon_custom_ar_enabled()
         return False
 
     @classmethod
