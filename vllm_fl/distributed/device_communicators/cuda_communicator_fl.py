@@ -230,6 +230,16 @@ def _ar_probe_enabled() -> bool:
     return os.getenv("VLLM_FL_HYGON_AR_PROBE", "0") == "1"
 
 
+def _uncached_staging_enabled() -> bool:
+    """Whether in-graph reductions also stage through the uncached IPC buffer.
+
+    On by default: reducing directly out of a cached inductor tensor is not
+    peer-coherent on gfx936. Set ``VLLM_FL_HYGON_AR_UNCACHED=0`` to restore
+    upstream behaviour (registered=True in-graph) for comparison.
+    """
+    return os.getenv("VLLM_FL_HYGON_AR_UNCACHED", "1") == "1"
+
+
 class _ARCaptureProbe:
     """Diagnostic wrapper that counts custom-allreduce calls in/out of a graph.
 
@@ -476,6 +486,61 @@ class _ARCaptureProbe:
         return self._inner.close()
 
 
+class _UncachedStagingCustomAllreduce:
+    """Force custom allreduce through the uncached staging buffer, even in-graph.
+
+    Fixes garbage activations (output degenerating to "!!!!") whenever custom
+    allreduce runs inside a captured CUDA graph on Hygon DCU.
+
+    ``CustomAllreduce.custom_all_reduce`` picks between two buffer strategies:
+
+      * not capturing -> ``all_reduce(inp, registered=False)``, which passes
+        ``buffer_ptrs[rank]`` as ``reg_buffer``. The kernel memcpys the input
+        into that buffer and reduces there. Those buffers are allocated with
+        ``hipExtMallocWithFlags(..., hipDeviceMallocUncached)``
+        (custom_all_reduce.cu:157, "data buffers need to be uncached for signal
+        on MI200"), so peer reads are coherent.
+      * capturing -> ``all_reduce(inp, registered=True)``, which passes
+        ``reg_buffer = 0``, so the kernel reduces straight out of
+        ``inp.data_ptr()`` -- an inductor/torch tensor in ordinary CACHED device
+        memory. On gfx936 a peer reading that over xGMI is not guaranteed to see
+        the owner's dirty L2 lines, so it reads stale bytes.
+
+    That asymmetry explains every measurement: the eager path is bit-exact while
+    graph replay is corrupt; both the installed fp32 kernel and the native bf16
+    kernel fail identically (the math is fine, the buffer memory type is not);
+    standalone tests pass because their inputs are freshly written tensors with
+    a device sync between replays; and with a single capture size only decode
+    (graphed) breaks while prefill (eager) still emits a correct first token.
+
+    Forcing ``registered=False`` inside the graph keeps the reduction on uncached
+    memory. The extra device-to-device memcpy is graph-capturable, and the
+    staging buffer gets recorded in ``graph_unreg_buffers_`` like any other
+    captured pointer -- registering one address many times is explicitly
+    supported (custom_all_reduce.cuh:484-490 declines to deduplicate).
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def should_custom_ar(self, inp: torch.Tensor) -> bool:
+        return self._inner.should_custom_ar(inp)
+
+    def custom_all_reduce(self, inp: torch.Tensor):
+        inner = self._inner
+        if inner.disabled or not inner.should_custom_ar(inp):
+            return None
+        if inner._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+            # Warmup inside capture(): mimic the out-of-place allocation without
+            # touching peers, exactly as upstream does.
+            return torch.empty_like(inp)
+        # Always stage through the uncached buffer, capturing or not.
+        return inner.all_reduce(inp, registered=False)
+
+
 class CudaCommunicatorFL(CudaCommunicator):
     """CudaCommunicator that can enable custom allreduce on Hygon DCU."""
 
@@ -583,28 +648,44 @@ class CudaCommunicatorFL(CudaCommunicator):
                 "Custom allreduce is NOT active on Hygon; falling back to "
                 "NCCL/RCCL for tensor-parallel all-reduce."
             )
-        elif native_bf16:
-            # ca_comm was built on the _C_hygon_custom_ar ops: bf16/fp16/fp32 all
-            # run on the native kernel, no fp32 upcast, no proxy needed.
-            logger.info(
-                "Native bf16 custom allreduce is active on Hygon "
-                "(world_size=%d, max_size=%d).",
-                ca.world_size,
-                ca.max_size,
-            )
-            _log_coverage(ca.max_size, native_bf16=True)
         else:
-            logger.info(
-                "Custom allreduce is active on Hygon via fp32 upcast "
-                "(world_size=%d, max_size=%d).",
-                ca.world_size,
-                ca.max_size,
-            )
-            # No native bf16 kernel; wrap so bf16 all-reduces run losslessly in
-            # fp32. `should_custom_ar` / `custom_all_reduce` are the only methods
-            # CudaCommunicator.all_reduce invokes; proxy delegates the rest.
-            self.ca_comm = _Fp32CustomAllreduce(ca)
-            _log_coverage(ca.max_size, native_bf16=False)
+            # Route every reduction through the uncached staging buffer, even
+            # in-graph. Reducing straight out of a cached inductor tensor is not
+            # peer-coherent on gfx936 and corrupts activations; see
+            # _UncachedStagingCustomAllreduce. Applied innermost so it also
+            # covers the fp32 proxy's upcast tensor.
+            if _uncached_staging_enabled():
+                ca = _UncachedStagingCustomAllreduce(ca)
+                self.ca_comm = ca
+                logger.info(
+                    "Custom allreduce will stage through the uncached IPC "
+                    "buffer for in-graph reductions too (set "
+                    "VLLM_FL_HYGON_AR_UNCACHED=0 to disable)."
+                )
+
+            if native_bf16:
+                # ca_comm was built on the _C_hygon_custom_ar ops: bf16/fp16/fp32
+                # all run on the native kernel, no fp32 upcast, no proxy needed.
+                logger.info(
+                    "Native bf16 custom allreduce is active on Hygon "
+                    "(world_size=%d, max_size=%d).",
+                    ca.world_size,
+                    ca.max_size,
+                )
+                _log_coverage(ca.max_size, native_bf16=True)
+            else:
+                logger.info(
+                    "Custom allreduce is active on Hygon via fp32 upcast "
+                    "(world_size=%d, max_size=%d).",
+                    ca.world_size,
+                    ca.max_size,
+                )
+                # No native bf16 kernel; wrap so bf16 all-reduces run losslessly
+                # in fp32. `should_custom_ar` / `custom_all_reduce` are the only
+                # methods CudaCommunicator.all_reduce invokes; proxy delegates
+                # the rest.
+                self.ca_comm = _Fp32CustomAllreduce(ca)
+                _log_coverage(ca.max_size, native_bf16=False)
 
         # Optional in/out-of-graph call accounting. Wraps whatever ca_comm ended
         # up being (native CustomAllreduce or the fp32 proxy) so both modes are
