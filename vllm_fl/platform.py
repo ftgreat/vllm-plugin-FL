@@ -43,13 +43,36 @@ dist_backend_dict = {
 }
 
 
+def hygon_custom_ar_mode() -> int:
+    """Selects the Hygon custom allreduce path via ``VLLM_FL_HYGON_CUSTOM_AR``.
+
+    ``0`` -> disabled (all-reduce served by NCCL/RCCL). This is the DEFAULT.
+    ``1`` -> enabled via the shipped fp32-upcast proxy.
+    ``2`` -> enabled via the standalone native bf16 kernel
+             (``_C_hygon_custom_ar``); if the .so cannot be loaded, custom
+             allreduce is disabled and NCCL/RCCL serves the all-reduce.
+
+    Default is ``0`` because an A/B on Qwen3.6-27B TP=2 (exp_39 vs exp_40)
+    measured mode 1 as a net loss: 1k/4k/64k were flat (ratio 0.999-1.000)
+    while 16k regressed -1.2% output tok/s with +12% P99 TPOT. Root cause:
+    the kernel never enters the decode CUDA graph ("Registering 0 cuda graph
+    addresses"), so the graph-capture benefit is never realised while the
+    eager-path cost (cudaMemcpy + bf16<->fp32 conversion, 2x bytes) is still
+    paid on every layer of every decode step.
+    """
+    try:
+        return int(os.getenv("VLLM_FL_HYGON_CUSTOM_AR", "0"))
+    except ValueError:
+        return 0
+
+
 def hygon_custom_ar_enabled() -> bool:
     """Kill-switch for the Hygon custom allreduce path.
 
-    Set ``VLLM_FL_HYGON_CUSTOM_AR=0`` to fall back to the previous behaviour
-    (custom allreduce disabled, all-reduce served by NCCL/RCCL).
+    Custom allreduce is OFF by default; set ``VLLM_FL_HYGON_CUSTOM_AR=1`` (fp32
+    proxy) or ``=2`` (native bf16) to opt in.
     """
-    return os.getenv("VLLM_FL_HYGON_CUSTOM_AR", "1") == "1"
+    return hygon_custom_ar_mode() != 0
 
 
 class PlatformFL(Platform):
