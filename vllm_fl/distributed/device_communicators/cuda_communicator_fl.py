@@ -28,15 +28,20 @@ import os
 import torch
 
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
-from vllm.logger import init_logger
 
+from vllm_fl.dispatch.logger_manager import get_logger
 from vllm_fl.platform import (
     PlatformFL,
     hygon_custom_ar_enabled,
     hygon_custom_ar_mode,
 )
 
-logger = init_logger(__name__)
+# NOTE: use the plugin's own get_logger, NOT vllm.logger.init_logger. The latter
+# returns a `vllm_fl.*`-named logger, and only the `vllm` logger tree gets a
+# handler/INFO level installed -- so `vllm_fl.*` inherits root's WARNING and
+# every logger.info() here is silently dropped (which is exactly why none of the
+# custom-allreduce startup diagnostics appeared in the exp_40/exp_41 logs).
+logger = get_logger(__name__)
 
 # The shipped `_C.abi3.so` only instantiates the custom_ar kernel for float32
 # and float16 (verified via `nm`); there is NO bfloat16 kernel. Passing bf16
