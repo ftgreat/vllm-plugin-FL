@@ -265,9 +265,66 @@ class _ARCaptureProbe:
         self._eager = 0
         self._warmup = 0
         self._skipped = 0  # should_custom_ar() said no -> served by NCCL/RCCL
+        self._capture_passes = 0
+        self._registered_total = 0
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+    @contextmanager
+    def capture(self):
+        """Instrument the capture lifecycle.
+
+        ``register_graph_buffers()`` runs at each ``capture()`` exit, advancing
+        the kernel's ``d_rank_data_base_`` by the number of buffers recorded and
+        then clearing the list (custom_all_reduce.cuh:491-515). vLLM enters
+        capture twice -- once for the memory-profiling pass whose graphs are
+        subsequently discarded (gpu_model_runner.py:5980 +
+        CUDAGraphWrapper.clear_all_graphs()), and once for the real pass
+        (:6093). If both passes register, the first pass permanently consumes
+        rank-data slots that describe freed memory.
+
+        The serving log shows a single "Registering 11008" per rank even though
+        both capture phases ran to 100%, so this logs, per pass: how many
+        buffers were pending just before the exit, and the running total across
+        passes. Two passes each reporting ~11008 (total ~22016) confirms the
+        double-registration theory; a single pass registering while the other
+        registers 0 refutes it.
+        """
+        self._capture_passes += 1
+        n = self._capture_passes
+        logger.info("[AR probe][capture] ENTER pass #%d", n)
+        try:
+            with self._inner.capture():
+                yield
+                # Read while still inside: the inner __exit__ calls
+                # register_graph_buffers(), which clears the pending list.
+                pending = self._pending_graph_buffers()
+                self._registered_total += pending
+                logger.info(
+                    "[AR probe][capture] pass #%d about to register %s buffers "
+                    "(running total %s). captured=%d warmup=%d eager=%d",
+                    n,
+                    pending,
+                    self._registered_total,
+                    self._captured,
+                    self._warmup,
+                    self._eager,
+                )
+        finally:
+            logger.info(
+                "[AR probe][capture] EXIT pass #%d (registration done)", n
+            )
+
+    def _pending_graph_buffers(self):
+        """Buffers recorded during this capture, not yet registered."""
+        try:
+            import vllm.distributed.device_communicators.custom_all_reduce as _car
+
+            return len(_car.ops.get_graph_buffer_ipc_meta(self._inner._ptr)[1])
+        except Exception:  # diagnostics must never break capture
+            logger.debug("could not read pending graph buffers", exc_info=True)
+            return -1
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         ok = self._inner.should_custom_ar(inp)
@@ -298,13 +355,15 @@ class _ARCaptureProbe:
     def _log(self, prefix: str) -> None:
         logger.info(
             "%s custom_all_reduce calls: captured=%d eager=%d warmup=%d "
-            "| should_custom_ar rejected (NCCL/RCCL)=%d. captured==0 means the "
-            "kernel never enters the decode CUDA graph.",
+            "| should_custom_ar rejected (NCCL/RCCL)=%d "
+            "| capture passes=%d, buffers registered across passes=%d.",
             prefix,
             self._captured,
             self._eager,
             self._warmup,
             self._skipped,
+            self._capture_passes,
+            self._registered_total,
         )
 
     def close(self):
