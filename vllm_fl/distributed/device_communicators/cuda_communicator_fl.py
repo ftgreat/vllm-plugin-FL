@@ -267,32 +267,39 @@ class _ARCaptureProbe:
         self._skipped = 0  # should_custom_ar() said no -> served by NCCL/RCCL
         self._capture_passes = 0
         self._registered_total = 0
+        self._capture_seq = None  # recorded only while capturing
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
     @contextmanager
     def capture(self):
-        """Instrument the capture lifecycle.
+        """Instrument the capture lifecycle and verify cross-rank agreement.
 
         ``register_graph_buffers()`` runs at each ``capture()`` exit, advancing
         the kernel's ``d_rank_data_base_`` by the number of buffers recorded and
-        then clearing the list (custom_all_reduce.cuh:491-515). vLLM enters
-        capture twice -- once for the memory-profiling pass whose graphs are
-        subsequently discarded (gpu_model_runner.py:5980 +
-        CUDAGraphWrapper.clear_all_graphs()), and once for the real pass
-        (:6093). If both passes register, the first pass permanently consumes
-        rank-data slots that describe freed memory.
+        then clearing the list (custom_all_reduce.cuh:491-515). Measured: exactly
+        ONE pass registers, 11008 buffers, symmetric on both ranks -- so the
+        double-registration theory is refuted, as is scale (a standalone test
+        replayed 11008 registered buffers bit-exact) and duplicate addresses.
 
-        The serving log shows a single "Registering 11008" per rank even though
-        both capture phases ran to 100%, so this logs, per pass: how many
-        buffers were pending just before the exit, and the running total across
-        passes. Two passes each reporting ~11008 (total ~22016) confirms the
-        double-registration theory; a single pass registering while the other
-        registers 0 refutes it.
+        What remains is ordering. During capture the kernel picks its rank-data
+        slot as ``d_rank_data_base_ + graph_unreg_buffers_.size()``
+        (custom_all_reduce.cuh:545) -- i.e. purely by call order. At replay each
+        kernel reads the slot baked in at capture, and slot ``i`` is only
+        meaningful if BOTH ranks recorded the same buffer at index ``i``.
+        Handwritten tests can't break this because both ranks run identical
+        Python loops, but in real serving the order comes from inductor-compiled
+        PIECEWISE subgraphs, where any per-rank difference in compilation or
+        scheduling would desynchronise the slots and corrupt peer pointers.
+
+        So at capture exit, before the inner exit registers anything, each rank
+        hashes its recorded (index, shape, dtype, numel) sequence and all-gathers
+        the digests. A mismatch localises the first diverging index.
         """
         self._capture_passes += 1
         n = self._capture_passes
+        self._capture_seq = []
         logger.info("[AR probe][capture] ENTER pass #%d", n)
         try:
             with self._inner.capture():
@@ -301,6 +308,7 @@ class _ARCaptureProbe:
                 # register_graph_buffers(), which clears the pending list.
                 pending = self._pending_graph_buffers()
                 self._registered_total += pending
+                self._check_capture_order(n, pending)
                 logger.info(
                     "[AR probe][capture] pass #%d about to register %s buffers "
                     "(running total %s). captured=%d warmup=%d eager=%d",
@@ -312,6 +320,7 @@ class _ARCaptureProbe:
                     self._eager,
                 )
         finally:
+            self._capture_seq = None  # release; can be ~11k entries
             logger.info(
                 "[AR probe][capture] EXIT pass #%d (registration done)", n
             )
@@ -339,12 +348,107 @@ class _ARCaptureProbe:
         if getattr(self._inner, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
                 self._captured += 1
+                # Record the slot-assignment order. The kernel's slot index is
+                # graph_unreg_buffers_.size() at this moment, so appending here
+                # mirrors it exactly.
+                if self._capture_seq is not None:
+                    self._capture_seq.append(
+                        (tuple(inp.shape), str(inp.dtype), inp.numel())
+                    )
             else:
                 self._warmup += 1
         else:
             self._eager += 1
         self._maybe_log()
         return self._inner.custom_all_reduce(inp)
+
+    def _check_capture_order(self, npass: int, pending) -> None:
+        """All-gather each rank's capture sequence digest and compare.
+
+        Slot ``i`` is only meaningful if every rank recorded the same buffer at
+        index ``i``. Compares a per-prefix rolling digest so a mismatch reports
+        the first diverging index rather than just "differs".
+        """
+        seq = self._capture_seq or []
+        try:
+            import hashlib
+
+            import torch.distributed as dist
+
+            group = getattr(self._inner, "group", None)
+            if group is None or not dist.is_initialized():
+                return
+
+            def digest(items):
+                h = hashlib.sha256()
+                for it in items:
+                    h.update(repr(it).encode())
+                return h.hexdigest()
+
+            payload = {
+                "n": len(seq),
+                "full": digest(seq),
+                # checkpoints let us bisect to the first divergence
+                "marks": {
+                    i: digest(seq[:i])
+                    for i in self._checkpoint_indices(len(seq))
+                },
+            }
+            world = dist.get_world_size(group=group)
+            gathered = [None] * world
+            dist.all_gather_object(gathered, payload, group=group)
+
+            ref = gathered[0]
+            mismatched = [
+                r for r, g in enumerate(gathered)
+                if g["n"] != ref["n"] or g["full"] != ref["full"]
+            ]
+            if not mismatched:
+                logger.info(
+                    "[AR probe][order] pass #%d: capture sequence IDENTICAL "
+                    "across all %d ranks (%d entries). Slot assignment is "
+                    "consistent.",
+                    npass,
+                    world,
+                    len(seq),
+                )
+                return
+
+            logger.warning(
+                "[AR probe][order] pass #%d: capture sequence DIVERGES across "
+                "ranks %s -- rank-data slots do not describe the same buffers, "
+                "so peer pointers are mismatched. lengths=%s",
+                npass,
+                mismatched,
+                [g["n"] for g in gathered],
+            )
+            # Report the earliest checkpoint at which any rank differs.
+            for i in sorted(ref["marks"]):
+                bad = [r for r, g in enumerate(gathered)
+                       if g["marks"].get(i) != ref["marks"][i]]
+                if bad:
+                    logger.warning(
+                        "[AR probe][order] first divergence is at or before "
+                        "capture index %d (ranks %s differ there). Local entry "
+                        "at that index: %s",
+                        i,
+                        bad,
+                        seq[i - 1] if 0 < i <= len(seq) else "n/a",
+                    )
+                    break
+        except Exception:  # diagnostics must never break capture
+            logger.debug("capture-order check failed", exc_info=True)
+
+    @staticmethod
+    def _checkpoint_indices(n: int, count: int = 64):
+        """Evenly spaced prefix lengths used to bisect a divergence."""
+        if n <= 0:
+            return []
+        step = max(1, n // count)
+        marks = list(range(step, n + 1, step))
+        if marks and marks[-1] != n:
+            marks.append(n)
+        return marks
 
     def _maybe_log(self) -> None:
         total = self._captured + self._eager + self._warmup + self._skipped
