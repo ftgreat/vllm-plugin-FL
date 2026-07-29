@@ -220,6 +220,94 @@ class _Fp32CustomAllreduce:
         return out.to(inp.dtype)
 
 
+def _ar_probe_enabled() -> bool:
+    """Whether to wrap ca_comm in the in/out-of-graph call-counting probe."""
+    return os.getenv("VLLM_FL_HYGON_AR_PROBE", "0") == "1"
+
+
+class _ARCaptureProbe:
+    """Diagnostic wrapper that counts custom-allreduce calls in/out of a graph.
+
+    Enabled with ``VLLM_FL_HYGON_AR_PROBE=1``. Motivation: on Qwen3.6-27B TP=2
+    the log shows ``Registering 0 cuda graph addresses``, and the kernel only
+    records a graph buffer when it runs while ``cudaStreamIsCapturing()`` is
+    Active. A 2-GPU controlled test proved neither the fp32 proxy nor
+    ``_IS_CAPTURING`` propagation is at fault, which leaves one question: during
+    real serving, is the all-reduce reached inside the captured decode graph at
+    all, or only on the eager path?
+
+    This wrapper answers it by tallying every ``custom_all_reduce`` call into
+    three buckets and logging the totals periodically:
+
+      ``captured``  -- called while the stream was actively capturing (the only
+                       case that yields the CUDA-graph benefit)
+      ``eager``     -- called outside any capture (pays cudaMemcpy, and for the
+                       fp32 proxy the bf16<->fp32 conversion, for no benefit)
+      ``warmup``    -- inside ``capture()`` but not yet capturing (vLLM's warmup
+                       pass; ``CustomAllreduce`` returns an empty tensor here)
+
+    A run dominated by ``eager`` with ``captured == 0`` confirms the all-reduce
+    never enters the decode graph, which is what makes mode 1 a net loss.
+
+    Purely observational: every call is delegated unchanged.
+    """
+
+    _LOG_EVERY = 2000
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._captured = 0
+        self._eager = 0
+        self._warmup = 0
+        self._skipped = 0  # should_custom_ar() said no -> served by NCCL/RCCL
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def should_custom_ar(self, inp: torch.Tensor) -> bool:
+        ok = self._inner.should_custom_ar(inp)
+        if not ok:
+            self._skipped += 1
+            self._maybe_log()
+        return ok
+
+    def custom_all_reduce(self, inp: torch.Tensor):
+        # Mirror CustomAllreduce.custom_all_reduce's own branch conditions so the
+        # bucket reflects the path actually taken, without duplicating its work.
+        if getattr(self._inner, "_IS_CAPTURING", False):
+            if torch.cuda.is_current_stream_capturing():
+                self._captured += 1
+            else:
+                self._warmup += 1
+        else:
+            self._eager += 1
+        self._maybe_log()
+        return self._inner.custom_all_reduce(inp)
+
+    def _maybe_log(self) -> None:
+        total = self._captured + self._eager + self._warmup + self._skipped
+        if total == 0 or total % self._LOG_EVERY:
+            return
+        self._log("[AR probe]")
+
+    def _log(self, prefix: str) -> None:
+        logger.info(
+            "%s custom_all_reduce calls: captured=%d eager=%d warmup=%d "
+            "| should_custom_ar rejected (NCCL/RCCL)=%d. captured==0 means the "
+            "kernel never enters the decode CUDA graph.",
+            prefix,
+            self._captured,
+            self._eager,
+            self._warmup,
+            self._skipped,
+        )
+
+    def close(self):
+        # Final tally, so short runs that never hit _LOG_EVERY still report.
+        self._log("[AR probe][final]")
+        return self._inner.close()
+
+
 class CudaCommunicatorFL(CudaCommunicator):
     """CudaCommunicator that can enable custom allreduce on Hygon DCU."""
 
@@ -309,6 +397,16 @@ class CudaCommunicatorFL(CudaCommunicator):
             # CudaCommunicator.all_reduce invokes; proxy delegates the rest.
             self.ca_comm = _Fp32CustomAllreduce(ca)
             _log_coverage(ca.max_size, native_bf16=False)
+
+        # Optional in/out-of-graph call accounting. Wraps whatever ca_comm ended
+        # up being (native CustomAllreduce or the fp32 proxy) so both modes are
+        # measurable with the same counters.
+        if self.ca_comm is not None and _ar_probe_enabled():
+            logger.info(
+                "[AR probe] VLLM_FL_HYGON_AR_PROBE=1: counting custom "
+                "allreduce calls inside vs outside CUDA graph capture."
+            )
+            self.ca_comm = _ARCaptureProbe(self.ca_comm)
 
 
 def _log_coverage(max_size: int, native_bf16: bool = False) -> None:
