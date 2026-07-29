@@ -75,6 +75,33 @@ def hygon_custom_ar_enabled() -> bool:
     return hygon_custom_ar_mode() != 0
 
 
+def hygon_custom_op_collectives() -> bool:
+    """Whether hygon routes collectives through ``torch.ops.vllm.all_reduce``.
+
+    Independently controllable via ``VLLM_FL_HYGON_CUSTOM_OP_AR``:
+      unset -> follow ``hygon_custom_ar_enabled()`` (routing rides with the
+               feature, since custom allreduce is unreachable without it)
+      ``1`` -> force routing ON
+      ``0`` -> force routing OFF
+
+    The override exists to separate two variables that were previously welded
+    together. Routing is what makes custom allreduce reachable at all, but
+    turning it on also corrupted output -- and it did so with BOTH the installed
+    ``_C_custom_ar`` (mode 1) and the standalone bf16 kernel (mode 2), which
+    rules out either kernel as the cause. Because mode 0 disabled routing *and*
+    custom allreduce together, no run so far isolates the routing change on its
+    own. Setting ``VLLM_FL_HYGON_CUSTOM_OP_AR=1`` with
+    ``VLLM_FL_HYGON_CUSTOM_AR=0`` gives exactly that: collectives go through the
+    opaque custom op while custom allreduce stays disabled, so every reduction is
+    served by NCCL/RCCL. If output is still wrong in that configuration, the
+    routing change alone breaks numerics and custom allreduce is not involved.
+    """
+    override = os.getenv("VLLM_FL_HYGON_CUSTOM_OP_AR")
+    if override is not None:
+        return override == "1"
+    return hygon_custom_ar_enabled()
+
+
 class PlatformFL(Platform):
     _enum = PlatformEnum.OOT
     device_info = DeviceInfo()
@@ -447,10 +474,12 @@ class PlatformFL(Platform):
             # tower) across a whole request that decoded ~1k tokens, and
             # "Registering 0 cuda graph addresses".
             #
-            # Gated on the kill-switch so mode 0 keeps the exact graph structure
-            # of the existing baseline -- switching collectives to a custom op
-            # changes the compiled graph and could affect fusion.
-            return hygon_custom_ar_enabled()
+            # Gated so mode 0 keeps the exact graph structure of the existing
+            # baseline -- switching collectives to a custom op changes the
+            # compiled graph and could affect fusion. Override with
+            # VLLM_FL_HYGON_CUSTOM_OP_AR to test routing independently of
+            # custom allreduce.
+            return hygon_custom_op_collectives()
         return False
 
     @classmethod
