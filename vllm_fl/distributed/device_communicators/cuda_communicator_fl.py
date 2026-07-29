@@ -316,7 +316,47 @@ class _ARCaptureProbe:
 class CudaCommunicatorFL(CudaCommunicator):
     """CudaCommunicator that can enable custom allreduce on Hygon DCU."""
 
+    # Entry-level accounting for VLLM_FL_HYGON_AR_PROBE=1. The ca_comm-level
+    # probe showed zero calls after ~110k expected all-reduces, which leaves two
+    # very different explanations. Counting here tells them apart:
+    #   * entry count 0  -> tensor-parallel reduction never reaches this
+    #     communicator at all, so custom allreduce has no attachment point in
+    #     this model and the feature cannot help it.
+    #   * entry count > 0 but ca_comm untouched -> the call arrives but an
+    #     earlier branch inside CudaCommunicator.all_reduce (symm-mem, quick
+    #     reduce, flashinfer) or a should_custom_ar rejection diverts it.
+    _ENTRY_LOG_EVERY = 2000
+
+    def all_reduce(self, input_):
+        if not getattr(self, "_probe_entry", False):
+            return super().all_reduce(input_)
+
+        self._entry_calls += 1
+        n = self._entry_calls
+        if n == 1 or n % self._ENTRY_LOG_EVERY == 0:
+            ca = self.ca_comm
+            # Ask the UNDERLYING communicator, not the probe wrapper, so this
+            # diagnostic does not inflate the probe's own `skipped` counter.
+            target = getattr(ca, "_inner", ca)
+            try:
+                covered = target.should_custom_ar(input_) if ca is not None else "n/a"
+            except Exception:  # diagnostics must never break the forward pass
+                covered = "error"
+            logger.info(
+                "[AR probe][entry] %s.all_reduce calls=%d shape=%s dtype=%s "
+                "ca_comm=%s should_custom_ar=%s",
+                self.unique_name,
+                n,
+                tuple(input_.shape),
+                input_.dtype,
+                type(ca).__name__ if ca is not None else None,
+                covered,
+            )
+        return super().all_reduce(input_)
+
     def __init__(self, *args, **kwargs):
+        self._probe_entry = _ar_probe_enabled()
+        self._entry_calls = 0
         if not (PlatformFL.vendor_name == "hygon" and hygon_custom_ar_enabled()):
             super().__init__(*args, **kwargs)
             return
