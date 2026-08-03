@@ -43,6 +43,65 @@ dist_backend_dict = {
 }
 
 
+def hygon_custom_ar_mode() -> int:
+    """Selects the Hygon custom allreduce path via ``VLLM_FL_HYGON_CUSTOM_AR``.
+
+    ``0`` -> disabled (all-reduce served by NCCL/RCCL). This is the DEFAULT.
+    ``1`` -> enabled via the shipped fp32-upcast proxy.
+    ``2`` -> enabled via the standalone native bf16 kernel
+             (``_C_hygon_custom_ar``); if the .so cannot be loaded, custom
+             allreduce is disabled and NCCL/RCCL serves the all-reduce.
+
+    Default is ``0`` because an A/B on Qwen3.6-27B TP=2 (exp_39 vs exp_40)
+    measured mode 1 as a net loss: 1k/4k/64k were flat (ratio 0.999-1.000)
+    while 16k regressed -1.2% output tok/s with +12% P99 TPOT. Root cause:
+    the kernel never enters the decode CUDA graph ("Registering 0 cuda graph
+    addresses"), so the graph-capture benefit is never realised while the
+    eager-path cost (cudaMemcpy + bf16<->fp32 conversion, 2x bytes) is still
+    paid on every layer of every decode step.
+    """
+    try:
+        return int(os.getenv("VLLM_FL_HYGON_CUSTOM_AR", "0"))
+    except ValueError:
+        return 0
+
+
+def hygon_custom_ar_enabled() -> bool:
+    """Kill-switch for the Hygon custom allreduce path.
+
+    Custom allreduce is OFF by default; set ``VLLM_FL_HYGON_CUSTOM_AR=1`` (fp32
+    proxy) or ``=2`` (native bf16) to opt in.
+    """
+    return hygon_custom_ar_mode() != 0
+
+
+def hygon_custom_op_collectives() -> bool:
+    """Whether hygon routes collectives through ``torch.ops.vllm.all_reduce``.
+
+    Independently controllable via ``VLLM_FL_HYGON_CUSTOM_OP_AR``:
+      unset -> follow ``hygon_custom_ar_enabled()`` (routing rides with the
+               feature, since custom allreduce is unreachable without it)
+      ``1`` -> force routing ON
+      ``0`` -> force routing OFF
+
+    The override exists to separate two variables that were previously welded
+    together. Routing is what makes custom allreduce reachable at all, but
+    turning it on also corrupted output -- and it did so with BOTH the installed
+    ``_C_custom_ar`` (mode 1) and the standalone bf16 kernel (mode 2), which
+    rules out either kernel as the cause. Because mode 0 disabled routing *and*
+    custom allreduce together, no run so far isolates the routing change on its
+    own. Setting ``VLLM_FL_HYGON_CUSTOM_OP_AR=1`` with
+    ``VLLM_FL_HYGON_CUSTOM_AR=0`` gives exactly that: collectives go through the
+    opaque custom op while custom allreduce stays disabled, so every reduction is
+    served by NCCL/RCCL. If output is still wrong in that configuration, the
+    routing change alone breaks numerics and custom allreduce is not involved.
+    """
+    override = os.getenv("VLLM_FL_HYGON_CUSTOM_OP_AR")
+    if override is not None:
+        return override == "1"
+    return hygon_custom_ar_enabled()
+
+
 class PlatformFL(Platform):
     _enum = PlatformEnum.OOT
     device_info = DeviceInfo()
@@ -300,6 +359,9 @@ class PlatformFL(Platform):
         if cls.dist_backend == "flagcx":
             logger.info("Using CommunicatorFL for communication.")
             return "vllm_fl.distributed.communicator.CommunicatorFL"  # noqa
+        elif cls.vendor_name == "hygon":
+            logger.info("Using CudaCommunicatorFL for communication.")
+            return "vllm_fl.distributed.device_communicators.cuda_communicator_fl.CudaCommunicatorFL"  # noqa
         else:
             logger.info("Using CudaCommunicator for communication.")
             return "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
@@ -349,10 +411,14 @@ class PlatformFL(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        if cls.vendor_name == "hygon":
-            return False
         if cls.dist_backend == "flagcx":
             return False
+        if cls.vendor_name == "hygon":
+            # Hygon DCU is a HIP/ROCm device and the `_C_custom_ar` extension
+            # works on it. The custom allreduce path itself only needs
+            # `is_cuda_alike()` for a single sanity assert, which
+            # CudaCommunicatorFL satisfies in a tightly scoped window.
+            return hygon_custom_ar_enabled()
         return True
 
     @classmethod
@@ -393,6 +459,27 @@ class PlatformFL(Platform):
     def use_custom_op_collectives(cls) -> bool:
         if cls.vendor_name == "nvidia":
             return True
+        if cls.vendor_name == "hygon":
+            # Custom allreduce can only be reached through the opaque
+            # `torch.ops.vllm.all_reduce` custom op. With this False,
+            # `GroupCoordinator.all_reduce` calls `_all_reduce_out_place`
+            # directly (parallel_state.py:513-516), Dynamo traces straight
+            # through it, and the collective is inlined into the compiled graph
+            # -- bypassing the device communicator entirely. The custom op is
+            # registered with a fake_impl (parallel_state.py:262), so it stays an
+            # opaque graph node whose body runs in Python during capture, which
+            # is exactly when custom allreduce must execute to register its
+            # graph buffers. Measured symptom of the False path: an entry probe
+            # on CudaCommunicatorFL.all_reduce counted 1 call (the eager vision
+            # tower) across a whole request that decoded ~1k tokens, and
+            # "Registering 0 cuda graph addresses".
+            #
+            # Gated so mode 0 keeps the exact graph structure of the existing
+            # baseline -- switching collectives to a custom op changes the
+            # compiled graph and could affect fusion. Override with
+            # VLLM_FL_HYGON_CUSTOM_OP_AR to test routing independently of
+            # custom allreduce.
+            return hygon_custom_op_collectives()
         return False
 
     @classmethod
